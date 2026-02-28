@@ -1,64 +1,80 @@
-jQuery(document).ready(function ($) {
-    $('#totosync-ajax-import').click(function () {
-        var offset = 0; // Initial offset
-        var batch_size = parseInt(totosync_ajax.batch_size); // Use the batch size from tososync_ajax object
-        var processed_products = 0; // Counter for processed products
+/* global totosyncAdmin, jQuery */
+jQuery( function ( $ ) {
+    'use strict';
 
-        // Function to process each batch
-        function processBatch() {
-            $.ajax({
-                url: totosync_ajax.ajaxurl,
-                type: 'POST',
-                data: {
-                    action: 'totosync_recursive_import',
-                    offset: offset
-                },
-                success: function (response) {
-                    // Parse the JSON response
-                    var nb_products = response.data.nb_products;
-                    if (response.success && response.data.nb_products) {
-                        var total_products = nb_products.total_products;
-                        var more_products = nb_products.more_products;
-                        // Check if there are more products to process
+    var BATCH     = 10;
+    var $btn      = $( '#totosync-btn' );
+    var $spinner  = $( '#totosync-spinner' );
+    var $wrap     = $( '#totosync-progress-wrap' );
+    var $bar      = $( '#totosync-progress' );
+    var $label    = $( '#totosync-label' );
+    var $result   = $( '#totosync-result' );
 
-                        if (total_products) {
-                            // If yes, recursively call processBatch after a delay (e.g., 1 second)
-                            offset += batch_size;
-                            processed_products += batch_size;
-                            // Check if total_products is a valid number
-                            if (!isNaN(total_products) && isFinite(total_products)) {
-                                // Update the progress bar value
-                                updateProgressBar(total_products, processed_products);
-                            } else {
-                                // Log an error or handle the invalid total_products value
-                                console.error('Invalid total products value:', total_products);
-                                return;
-                            }
-                            setTimeout(processBatch, 1000);
-                        }
-                        if (more_products) {
-                            // console.log(offset);
-                            // console.log(nb_products.total_products);
-                            // If no more products, show completion message or perform any other action
-                            console.log('All products processed');
-                        }
-                    } else {
-                        // Handle error
-                        // console.log('Error processing batch');
-                        console.log('End of batch');
-                    }
-                },
-                error: function (xhr, status, error) {
-                    console.log('Error: ' + error); // Log error message
-                }
-            });
-        }
+    $btn.on( 'click', function () {
+        $btn.prop( 'disabled', true );
+        $spinner.css( 'visibility', 'visible' );
+        $wrap.show();
+        $bar.val( 0 );
+        $label.text( 'Fetching products from API\u2026' );
+        $result.empty();
 
-        // Start processing batches
-        processBatch();
-    });
-    function updateProgressBar(total, processed) {
-        var progress = Math.round((processed / total) * 100);
-        $('#progress-bar').val(progress);
+        runBatch( 0 );
+    } );
+
+    function runBatch( offset ) {
+        $.post( totosyncAdmin.ajaxurl, {
+            action:     'totosync_sync',
+            nonce:      totosyncAdmin.nonce,
+            offset:     offset,
+            batch_size: BATCH,
+        } )
+        .done( function ( res ) {
+            if ( ! res.success ) {
+                showError( res.data || 'Unknown server error.' );
+                return;
+            }
+
+            var d         = res.data;
+            var processed = Math.min( offset + BATCH, d.total );
+            var pct       = d.total > 0 ? Math.round( ( processed / d.total ) * 100 ) : 100;
+
+            $bar.val( pct );
+            $label.text( 'Processing ' + processed + ' / ' + d.total + ' products (' + pct + '%)' );
+
+            if ( d.done ) {
+                $bar.val( 100 );
+                $label.text( 'Done! All ' + d.total + ' products synced.' );
+                $result.html(
+                    '<div class="notice notice-success inline" style="display:block;">' +
+                    '<p>Sync complete. Reloading in 3 s to refresh the log\u2026</p></div>'
+                );
+                setTimeout( function () { location.reload(); }, 3000 );
+                resetUI();
+            } else {
+                // Small pause between batches so we don't hammer the server.
+                setTimeout( function () { runBatch( offset + BATCH ); }, 400 );
+            }
+        } )
+        .fail( function ( xhr, status, err ) {
+            showError( 'Request failed: ' + err );
+        } );
     }
-});
+
+    function showError( msg ) {
+        $result.html(
+            '<div class="notice notice-error inline" style="display:block;"><p>' +
+            escHtml( msg ) + '</p></div>'
+        );
+        resetUI();
+    }
+
+    function resetUI() {
+        $btn.prop( 'disabled', false );
+        $spinner.css( 'visibility', 'hidden' );
+    }
+
+    // Minimal XSS-safe escaper for dynamic content inserted into the DOM.
+    function escHtml( str ) {
+        return $( '<span>' ).text( str ).html();
+    }
+} );
