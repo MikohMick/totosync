@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
- * Version:     2.0.0
+ * Version:     2.1.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,8 +18,9 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.0.0' );
-define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/197.248.191.179' );
+define( 'TOTOSYNC_VERSION',   '2.1.0' );
+define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
+define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
 define( 'TOTOSYNC_LAST_OPT',  'totosync_last_sync' );
@@ -699,7 +700,8 @@ function totosync_get_or_create_category( $name ) {
  * Transform a raw image URL from the POS API:
  *
  *   ftp://197.248.191.179/items_images/foo.png  →  http://197.248.191.179/items_images/foo.png
- *   ftp://192.168.0.30/items_images/foo.png     →  false   (private IP — skip image, keep product)
+ *   ftp://192.168.0.30/items_images/foo.png     →  http://197.248.191.179/items_images/foo.png
+ *     (private IP rewritten to known public POS IP — handles transition from 192.x → 197.x)
  *   http://197.248.191.179/foo.png              →  returned as-is
  *
  * Products whose imageUrls are ALL private/unreachable are still synced
@@ -718,9 +720,11 @@ function totosync_transform_image_url( $url ) {
     $host   = $parsed['host'] ?? '';
     $path   = $parsed['path'] ?? '/';
 
-    // Any private / reserved / loopback address → skip the image.
+    // Private / reserved / loopback address — rewrite to the known public POS IP
+    // so images previously served on the local network (e.g. 192.168.x.x) are
+    // still fetched after the server moves to its public address (TOTOSYNC_POS_IP).
     if ( totosync_is_private_host( $host ) ) {
-        return false;
+        $host = TOTOSYNC_POS_IP;
     }
 
     if ( $scheme === 'ftp' ) {
@@ -729,7 +733,8 @@ function totosync_transform_image_url( $url ) {
     }
 
     if ( in_array( $scheme, [ 'http', 'https' ], true ) ) {
-        return $url;
+        // If host was rewritten, rebuild the URL with the public IP.
+        return $scheme . '://' . $host . $path;
     }
 
     return false; // Unknown or unsupported scheme.
