@@ -1,655 +1,804 @@
 <?php
-
-/*
-  Plugin Name: Totosync
-  Description: Import products from JSON API into WooCommerce.
-  Version: 1.1
-  Author: rindradev@gmail.com
+/**
+ * Plugin Name: ToToSync
+ * Plugin URI:  https://github.com/MikohMick/totosync
+ * Description: Syncs featured products from POS API into WooCommerce — variable products,
+ *              attributes (Colour + Measurement), images, prices, and live stock levels.
+ *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
+ * Version:     2.0.0
+ * Author:      rindradev@gmail.com
+ * Requires at least: 5.8
+ * Requires PHP: 7.4
+ * WC requires at least: 5.0
  */
 
-// Function to import products from JSON API
-function totosync_import_products() {
-//    $json_data = file_get_contents('http://shop.ruelsoftware.co.ke/api/featuredproducts/197.248.191.179');
-    $json_data = '[{"itemId":2628,"itemName":"SIT ME UP","description":"SIT ME UP","itemCode":"2628","productCategory":"Nursery gear and furniture","price1":3400,"price2":0,"price3":0,"price4":0,"measurement":" Piece","colour":"PEACH","quantity":1,"isFeatured":true,"imageUrls":["http://197.248.191.179/2628/08_49_14.png"]},
-	{"itemId":2627,"itemName":"SIT ME UP","description":"SIT ME UP","itemCode":"2627","productCategory":"Nursery gear and furniture","price1":3400,"price2":0,"price3":0,"price4":0,"measurement":" Piece","colour":"PINK AND ORANGE","quantity":1,"isFeatured":true,"imageUrls":["http://197.248.191.179/2627/08_51_02.png"]},
-	{"itemId":2626,"itemName":"SIT ME UP","description":"SIT ME UP","itemCode":"2626","productCategory":"Nursery gear and furniture","price1":3400,"price2":0,"price3":0,"price4":0,"measurement":" Piece","colour":"PINK AND GREEN","quantity":2,"isFeatured":true,"imageUrls":["http://197.248.191.179/2626/08_51_27.png"]},
-	{"itemId":2629,"itemName":"L PREGNANCY PILLOW","description":"L PREGNANCY PILLOW","itemCode":"2629","productCategory":"Diapering and mother care","price1":3400,"price2":0,"price3":0,"price4":0,"measurement":" Piece","colour":"MAROON","quantity":1,"isFeatured":true,"imageUrls":["http://197.248.191.179/2629/12_21_33.png"]},
-	{"itemId":2635,"itemName":"BOTTLE BANK MEDIUM 10204","description":"BOTTLE BANK MEDIUM 10204","itemCode":"2635","productCategory":"Feeding accessories","price1":2000,"price2":0,"price3":0,"price4":0,"measurement":" Piece","colour":"PINK","quantity":0,"isFeatured":true,"imageUrls":["http://197.248.191.179/2635/08_55_08.png"]}]';
+defined( 'ABSPATH' ) || exit;
 
-    if ($json_data === false) {
-        // Handle error
-        return;
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+define( 'TOTOSYNC_VERSION',   '2.0.0' );
+define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/197.248.191.179' );
+define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
+define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
+define( 'TOTOSYNC_LAST_OPT',  'totosync_last_sync' );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
+
+register_activation_hook(   __FILE__, 'totosync_activate' );
+register_deactivation_hook( __FILE__, 'totosync_deactivate' );
+
+add_action( 'admin_menu',            'totosync_admin_menu' );
+add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
+add_action( 'wp_ajax_totosync_sync', 'totosync_ajax_handler' );
+add_action( TOTOSYNC_CRON_HOOK,      'totosync_run_sync' );
+
+// Register a 30-minute cron interval ("twicehourly" if WordPress doesn't ship one).
+add_filter( 'cron_schedules', function ( $schedules ) {
+    if ( ! isset( $schedules['twicehourly'] ) ) {
+        $schedules['twicehourly'] = [
+            'interval' => 30 * MINUTE_IN_SECONDS,
+            'display'  => 'Twice Per Hour (every 30 min)',
+        ];
     }
-    totosync_parse_json($json_data);
-}
+    return $schedules;
+} );
 
-// Function to import products from JSON API from AJAX call
-function totosync_batch_import_products($offset, $batch_size) {
-    // Start the session if not already started
-    if (session_status() === PHP_SESSION_NONE) {
-        session_start();
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+// Activation / Deactivation
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // Generate a unique file name for the user session
-    $session_id = session_id();
-    if (empty($session_id)) {
-        // Generate a session ID if it's empty
-        $session_id = uniqid();
-        session_id($session_id);
-        session_start();
-    }
-
-    // Check if the file exists
-    $file_name = __DIR__ . '/temp/totosync_data_' . $session_id . '.json';
-    if (file_exists($file_name)) {
-        // Read JSON data from the file
-        $json_data = file_get_contents($file_name);
-    } else {
-        // Fetch JSON data from the API
-        $json_data = file_get_contents('http://shop.ruelsoftware.co.ke/api/featuredproducts/197.248.191.179');
-
-        // Save JSON data to the file
-        file_put_contents($file_name, $json_data);
-    }
-
-    // Convert JSON data to array
-    $products = json_decode($json_data, true);
-
-    // Check if JSON decoding was successful
-    if ($products === null) {
-        // Handle JSON decoding error
-        return;
-    }
-
-    // Get the total number of products
-    $total_products = count($products);
-
-    // Slice the array to get a chunk of products starting from the given offset
-    $chunk = array_slice($products, $offset, $batch_size);
-
-    // Check if there are products to process
-    if (!empty($chunk)) {
-        // Loop through each product chunk and process them
-        foreach ($chunk as $product) {
-            // Example: Process each product
-            totosync_parse_single_json(json_encode($product));
-        }
-
-        // Check if there are more products to process
-        $more_products = $offset + $batch_size < $total_products;
-
-        // Return the total number of products and whether there are more products to process
-        return array(
-            'total_products' => $total_products,
-            'more_products' => $more_products
-        );
-    } else {
-        // No more products to process
-        // Delete the file
-        unlink($file_name);
-        return false;
+function totosync_activate() {
+    if ( ! wp_next_scheduled( TOTOSYNC_CRON_HOOK ) ) {
+        wp_schedule_event( time(), 'twicehourly', TOTOSYNC_CRON_HOOK );
     }
 }
 
-// Function to import products from JSON API - ajax callback
-add_action('wp_ajax_totosync_recursive_import', 'totosync_recursive_import_callback');
-
-function totosync_recursive_import_callback() {
-    // Set time limit to 0 to prevent script from timing out
-    set_time_limit(0);
-
-    // Get offset and batch size from AJAX request
-    $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
-    $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 10; // Default batch size
-    // Call import function to process products in batches
-    $total_products = totosync_batch_import_products($offset, $batch_size);
-
-    // Send response back to JavaScript
-    if ($total_products !== false) {
-        wp_send_json_success(array('nb_products' => $total_products));
-    } else {
-        wp_send_json_error('No more products to process');
-    }
-    wp_die(); // Always include wp_die() to end AJAX processing
-}
-
-function totosync_enqueue_scripts($hook) {
-    // Enqueue JavaScript file
-    wp_enqueue_script('totosync-script', plugin_dir_url(__FILE__) . 'script.js', array('jquery'), '1.0', true);
-
-    // Define batch size
-    $batch_size = 10;
-
-    // Localize AJAX URL and batch size
-    wp_localize_script('totosync-script', 'totosync_ajax', array(
-        'ajaxurl' => admin_url('admin-ajax.php'),
-        'batch_size' => $batch_size
-    ));
-}
-
-// Define function to enqueue JavaScript and localize AJAX URL
-add_action('admin_enqueue_scripts', 'totosync_enqueue_scripts');
-
-// Function to parse JSON data
-function totosync_parse_json($json_data) {
-    $product = json_decode($json_data, true);
-    if ($products) {
-        foreach ($products as $product) {
-            print_r($product);
-            die();
-            // Ignore product if no image
-            if (empty($product['imageUrls'])) {
-                continue;
-            }
-
-            // Check if the product already exists in the database by name
-            $existing_product_id = totosync_get_product_id_by_name($product['itemName']);
-            if (!empty($product['measurement']) && !empty($product['colour'])) {
-                // Product with "measurement" and "colour" fields is treated as a variation
-                if ($existing_product_id) {
-                    // Product with the same name exists, treat it as a variation
-                    totosync_create_variation($product);
-                } else {
-                    // Product with the same name doesn't exist, create a variable product first
-                    $variable_product_id = totosync_create_variable_product($product);
-                    // Then create the variation
-                    totosync_create_variation($product, $variable_product_id);
-                }
-            } else {
-                // Product without both "measurement" and "colour" fields is treated as a simple product
-                if ($existing_product_id) {
-                    // Product with the same name exists, treat it as a variation
-                    totosync_create_variation($product);
-                } else {
-                    // Product with the same name doesn't exist, treat it as a simple product
-                    totosync_create_product($product);
-                }
-            }
-        }
+function totosync_deactivate() {
+    $ts = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
+    if ( $ts ) {
+        wp_unschedule_event( $ts, TOTOSYNC_CRON_HOOK );
     }
 }
 
-// Function to parse single JSON data
-function totosync_parse_single_json($json_data) {
-    $product = json_decode($json_data, true);
-    if ($product === null) {
-        // Handle JSON decoding error
-        return;
-    }
-
-    // Ignore product if no image
-    if (empty($product['imageUrls'])) {
-        return;
-    }
-
-    // Check if the product already exists in the database by name
-    $existing_product_id = totosync_get_product_id_by_name($product['itemName']);
-    if (!empty($product['measurement']) && !empty($product['colour'])) {
-        // Product with "measurement" and "colour" fields is treated as a variation
-        if ($existing_product_id) {
-            // Product with the same name exists, treat it as a variation
-            totosync_create_variation($product);
-        } else {
-            // Product with the same name doesn't exist, create a variable product first
-            $variable_product_id = totosync_create_variable_product($product);
-            // Then create the variation
-            totosync_create_variation($product, $variable_product_id);
-        }
-    } else {
-        // Product without both "measurement" and "colour" fields is treated as a simple product
-        if ($existing_product_id) {
-            // Product with the same name exists, treat it as a variation
-            totosync_create_variation($product);
-        } else {
-            // Product with the same name doesn't exist, treat it as a simple product
-            totosync_create_product($product);
-        }
-    }
-}
-
-// Function to create or update product
-function totosync_create_variable_product($product_data) {
-    // Check if product already exists by name
-    $product_id = totosync_get_product_id_by_name($product_data['itemName']);
-
-    if (!$product_id) {
-        // Product does not exist, create new variable product
-        $new_product = new WC_Product_Variable();
-        $new_product->set_name($product_data['itemName']);
-        $new_product->set_description($product_data['description']);
-        $new_product->set_category_ids([totosync_get_or_create_category($product_data['productCategory'])]); // Set category
-        $new_product_id = $new_product->save();
-
-        // Attach images to product
-        if (!empty($product_data['imageUrls'])) {
-            totosync_attach_images($new_product_id, $product_data['imageUrls']);
-        }
-
-        $product_id = $new_product_id;
-    } else {
-        // Product exists, update existing product
-        $product = wc_get_product($product_id);
-        // Set category
-        $product->set_category_ids([totosync_get_or_create_category($product_data['productCategory'])]);
-        // Save the product
-        $product->save();
-    }
-
-    // Set attributes for variable product
-    $attributes = [
-        'measurement' => $product_data['measurement'],
-        'colour' => $product_data['colour']
-    ];
-
-    // Create or update product attributes and terms
-    foreach ($attributes as $attribute_name => $attribute_value) {
-        $attribute_slug = sanitize_title($attribute_name);
-        $term_slug = sanitize_title($attribute_value);
-
-        // Check if attribute exists
-        $attribute = wc_get_attribute($attribute_slug);
-        if (!$attribute) {
-            // If attribute doesn't exist, create it
-            $args = [
-                'name' => $attribute_name,
-                'slug' => $attribute_slug,
-                'type' => 'select',
-                'order_by' => 'menu_order',
-                'has_archives' => true,
-            ];
-            wc_create_attribute($args);
-            register_taxonomy('pa_' . $attribute_slug, array('product'), array());
-        }
-
-        // Check if term exists
-        $term_exists = term_exists($term_slug, 'pa_' . $attribute_slug);
-
-        if (!$term_exists) {
-            // If term doesn't exist, create it
-            $term_data = wp_insert_term($attribute_value, 'pa_' . $attribute_slug, ['slug' => $term_slug]);
-            if (is_wp_error($term_data)) {
-                // Term creation failed, log or display the error
-                error_log("Term creation failed: " . $term_data->get_error_message()); // Log error
-                return false; // Return false to indicate failure
-            } else {
-                // Get the term ID
-                $term_id = $term_data['term_id'];
-                // Attach the term to the product
-                wp_set_object_terms($product_id, $term_id, 'pa_' . $attribute_slug, true);
-            }
-        } else {
-            // Term already exists, get the term object
-            $term = get_term_by('slug', $term_slug, 'pa_' . $attribute_slug);
-            // Attach the term to the product
-            wp_set_object_terms($product_id, $term->term_id, 'pa_' . $attribute_slug, true);
-        }
-    }
-
-    return true; // Return true to indicate success
-}
-
-// Function to create variation for existing variable product
-function totosync_create_variation($product_data) {
-    // Get existing variable product
-    $product_id = totosync_get_product_id_by_name($product_data['itemName']);
-
-    // Check if product exists
-    if (!$product_id) {
-        // Product doesn't exist, cannot create variation
-        return;
-    }
-
-    // Get existing product object
-    $product = wc_get_product($product_id);
-
-    // Ensure product object is valid
-    if (!$product) {
-        // Product object is not valid, cannot create variation
-        return;
-    }
-
-    // Attach attributes to product - display product attributes
-    totosync_add_product_attributes($product_id);
-
-    // Check if a variation with the same attributes already exists
-    $existing_variation_id = totosync_get_existing_variation_id($product_id, $product_data);
-
-    // Set attributes
-    $attributes = [
-        'pa_measurement' => $product_data['measurement'], // Assuming $product_data['measurement'] contains attribute value
-        'pa_colour' => $product_data['colour'] // Assuming $product_data['colour'] contains attribute value
-    ];
-
-    if ($existing_variation_id) {
-        try {
-            // Variation with the same attributes already exists, update its price
-            $variation = wc_get_product($existing_variation_id);
-            $variation->set_regular_price($product_data['price1']);
-            $variation->set_sku($product_data['itemCode']);
-            $variation->set_description($product_data['description']);
-            // Set the stock quantity
-            $variation->set_stock_quantity($product_data['quantity']);
-            // Enable or disable stock management
-            $variation->set_manage_stock(true);
-
-            $variation->save();
-        } catch (Exception $e) {
-            // Handle the exception gracefully
-            // For example, log the error or display a message to the user
-            error_log('Error updating variation SKU ' . $product_data['itemCode'] . ' : ' . $e->getMessage());
-            // Optionally, you can choose to stop further processing or continue with other operations
-        }
-        // If variation is successfully saved, set variation attributes
-        totosync_set_variation_attributes($existing_variation_id, $attributes);
-
-        $variation_has_pictures = has_post_thumbnail($existing_variation_id);
-
-        if (!$variation_has_pictures) {
-            // Attach images to product
-            if (!empty($product_data['imageUrls'])) {
-                totosync_attach_images_to_variation($existing_variation_id, $product_data['imageUrls']);
-            }
-        }
-    } else {
-        try {
-            // Create a new variation object
-            $variation = new WC_Product_Variation();
-
-            // Set variation properties
-            $variation->set_regular_price($product_data['price1']);
-            $variation->set_parent_id($product_id);
-
-            $variation->set_sku($product_data['itemCode']);
-            $variation->set_description($product_data['description']);
-            // Set the stock quantity
-            $variation->set_stock_quantity($product_data['quantity']);
-            // Enable or disable stock management
-            $variation->set_manage_stock(true);
-
-            // Save the variation
-            $variation_id = $variation->save();
-
-            if ($variation_id) {
-                // If variation is successfully saved, set variation attributes
-                totosync_set_variation_attributes($variation_id, $attributes);
-
-                // Attach images to product
-                if (!empty($product_data['imageUrls'])) {
-                    totosync_attach_images_to_variation($variation_id, $product_data['imageUrls']);
-                }
-            }
-        } catch (Exception $e) {
-            // Handle the exception gracefully
-            // For example, log the error or display a message to the user
-            error_log('Error updating variation SKU ' . $product_data['itemCode'] . ' : ' . $e->getMessage());
-            // Optionally, you can choose to stop further processing or continue with other operations
-        }
-    }
-}
-
-// set variation attributes
-function totosync_set_variation_attributes($variation_id, $attributes) {
-    if ($variation_id) {
-        foreach ($attributes as $attribute_key => $attribute_value) {
-            // Get the term object for the attribute value
-            $term = get_term_by('slug', sanitize_title($attribute_value), $attribute_key);
-
-            if ($term) {
-                // Add meta data entry to wp_postmeta table
-                add_post_meta($variation_id, 'attribute_' . $attribute_key, $term->slug);
-
-                // Attach the term to the product
-                $variation = wc_get_product($variation_id);
-                $product_id = $variation->get_parent_id();
-                wp_set_object_terms($product_id, $term->term_id, $attribute_key, true);
-            } else {
-                // If the term doesn't exist, create it and set it for the variation attribute
-                $new_term = wp_insert_term($attribute_value, $attribute_key);
-                if (!is_wp_error($new_term)) {
-                    $term = get_term_by('id', $new_term['term_id'], $attribute_key);
-                    add_post_meta($variation_id, 'attribute_' . $attribute_key, $term->slug);
-
-                    // Attach the term to the product
-                    $variation = wc_get_product($variation_id);
-                    $product_id = $variation->get_parent_id();
-                    wp_set_object_terms($product_id, $term->term_id, $attribute_key, true);
-                }
-            }
-        }
-    }
-}
-
-// Function add product attributes
-function totosync_add_product_attributes($product_id) {
-    // update the _product_attributes meta field
-    $product_attributes = [
-        'pa_colour' => [
-            'name' => 'pa_colour',
-            'value' => '', // Leave empty for now, will be updated later
-            'position' => 1,
-            'is_visible' => 1,
-            'is_variation' => 1,
-            'is_taxonomy' => 1
-        ],
-        'pa_measurement' => [
-            'name' => 'pa_measurement',
-            'value' => '', // Leave empty for now, will be updated later
-            'position' => 0,
-            'is_visible' => 1,
-            'is_variation' => 1,
-            'is_taxonomy' => 1
-        ],
-    ];
-
-    // Check if _product_attributes meta key already exists for the product
-    $product_attributes_existing = get_post_meta($product_id, '_product_attributes', true);
-
-    if (empty($product_attributes_existing)) {
-        // If _product_attributes meta key doesn't exist, serialize and save the product attributes
-        update_post_meta($product_id, '_product_attributes', $product_attributes);
-    }
-}
-
-// Function to get product ID by name
-function totosync_get_product_id_by_name($product_name) {
-    $args = array(
-        'post_type' => 'product',
-        'post_status' => 'any',
-        'posts_per_page' => 1,
-        'fields' => 'ids',
-        's' => $product_name
-    );
-    $product_query = new WP_Query($args);
-    return $product_query->have_posts() ? $product_query->posts[0] : 0;
-}
-
-// Function to get existing variation ID by attributes
-function totosync_get_existing_variation_id($product_id, $product_data) {
-    // Check if the product ID is valid
-    if (empty($product_id) || !is_numeric($product_id)) {
-        return 0;
-    }
-
-    // Attempt to get the product object
-    $product = wc_get_product($product_id);
-
-    // Check if the product object is valid
-    if (!$product || is_wp_error($product)) {
-        return 0;
-    }
-
-    // Check if the product is a variable product
-    if ($product->is_type('variable')) {
-        // Loop through its variations
-        foreach ($product->get_children() as $variation_id) {
-            $variation = wc_get_product($variation_id);
-            // Check if the variation matches the provided attributes
-            if ($variation) {
-                if (trim($variation->get_attribute('pa_measurement')) == trim($product_data['measurement']) &&
-                        trim($variation->get_attribute('pa_colour')) === trim($product_data['colour'])) {
-                    return $variation_id;
-                }
-            }
-        }
-    } elseif ($product->is_type('variation')) {
-        // If the product is a variation itself, directly check its attributes
-        if ($product->get_attribute('pa_measurement') == $product_data['measurement'] &&
-                $product->get_attribute('pa_colour') == $product_data['colour']) {
-            return $product_id;
-        }
-    }
-
-    return 0;
-}
-
-// Function to create simple product
-function totosync_create_product($product_data) {
-    // Check if product exists by name
-    $product_id = totosync_get_product_id_by_name($product_data['itemName']);
-
-    // Get product category ID or create new category
-    $category_id = totosync_get_or_create_category($product_data['productCategory']);
-
-    if ($product_id) {
-        // Update existing product
-        $product = wc_get_product($product_id);
-        $product->set_name($product_data['itemName']);
-        $product->set_regular_price($product_data['price1']);
-        $product->set_category_ids([$category_id]);
-        $product->save();
-    } else {
-        // Create new product
-        $new_product = new WC_Product_Simple();
-        $new_product->set_name($product_data['itemName']);
-        $new_product->set_regular_price($product_data['price1']);
-        $new_product->set_category_ids([$category_id]);
-        $new_product->save();
-
-        // Attach images to product
-        if (!empty($product_data['imageUrls'])) {
-            totosync_attach_images($new_product->get_id(), $product_data['imageUrls']);
-        }
-    }
-}
-
-// Function to get or create category and return its ID
-function totosync_get_or_create_category($category_name) {
-    // Check if category exists
-    $term = get_term_by('name', $category_name, 'product_cat');
-    if ($term) {
-        return $term->term_id;
-    } else {
-        // Create new category
-        $term = wp_insert_term($category_name, 'product_cat');
-        if (!is_wp_error($term)) {
-            return $term['term_id'];
-        } else {
-            // Error handling: Failed to create category
-            return 0;
-        }
-    }
-}
-
-// Function to attach images to products
-function totosync_attach_images($product_id, $image_urls) {
-
-    // Check if product already has a featured image
-    if (has_post_thumbnail($product_id)) {
-        return false; // product already has a featured image, exit the function
-    }
-
-    foreach ($image_urls as $image_url) {
-        $image_id = totosync_upload_image_from_url($image_url);
-        if ($image_id) {
-            set_post_thumbnail($product_id, $image_id);
-        }
-    }
-}
-
-// Function to attach images to variation
-function totosync_attach_images_to_variation($variation_id, $image_urls) {
-
-    // Check if variation already has a featured image
-    if (has_post_thumbnail($variation_id)) {
-        return false; // Variation already has a featured image, exit the function
-    }
-
-    foreach ($image_urls as $image_url) {
-        // Upload the image from URL and get its ID
-        $image_id = media_sideload_image($image_url, $variation_id, '', 'id');
-
-        if (is_wp_error($image_id)) {
-            return false; // Exit if image upload fails
-        }
-
-        // Set the image as the post thumbnail of the variation
-        set_post_thumbnail($variation_id, $image_id);
-
-        return true;
-    }
-}
-
-// Function to upload image from URL
-function totosync_upload_image_from_url($image_url) {
-    $upload_dir = wp_upload_dir();
-    $image_data = file_get_contents($image_url);
-    $filename = basename($image_url);
-    if (wp_mkdir_p($upload_dir['path'])) {
-        $file = $upload_dir['path'] . '/' . $filename;
-    } else {
-        $file = $upload_dir['basedir'] . '/' . $filename;
-    }
-    file_put_contents($file, $image_data);
-    $wp_filetype = wp_check_filetype($filename, null);
-    $attachment = [
-        'post_mime_type' => $wp_filetype['type'],
-        'post_title' => sanitize_file_name($filename),
-        'post_content' => '',
-        'post_status' => 'inherit'
-    ];
-    $attachment_id = wp_insert_attachment($attachment, $file);
-    require_once(ABSPATH . 'wp-admin/includes/image.php');
-    $attachment_data = wp_generate_attachment_metadata($attachment_id, $file);
-    wp_update_attachment_metadata($attachment_id, $attachment_data);
-    return $attachment_id;
-}
-
-// Add admin menu
-add_action('admin_menu', 'totosync_admin_menu');
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin UI
+// ─────────────────────────────────────────────────────────────────────────────
 
 function totosync_admin_menu() {
     add_menu_page(
-            'Totosync Settings',
-            'Totosync',
-            'manage_options',
-            'totosync-settings',
-            'totosync_settings_page'
+        'ToToSync',
+        'ToToSync',
+        'manage_options',
+        'totosync',
+        'totosync_page',
+        'dashicons-update',
+        56
     );
 }
 
-// Settings page callback
-function totosync_settings_page() {
-    // Display your settings page content here
-    echo '<div class="wrap">';
-    echo '<h1>Totosync Settings</h1>';
-    echo '<p>Click the button below to start the import process.</p>';
-    echo '<form method="post" action="">';
-    echo '<input type="hidden" name="totosync_import" value="true">';
-    echo '<button type="submit" class="button button-primary">Import Products</button>';
-    echo '</form>';
-
-    // Add button to trigger AJAX process
-    echo '<p>Click the button below to start the AJAX import process recursively.</p>';
-    echo '<button id="totosync-ajax-import" class="button button-secondary">Recursive AJAX Import</button>';
-
-    if (isset($_POST['totosync_import']) && $_POST['totosync_import'] == 'true') {
-        totosync_import_products();
-        echo '<div class="notice notice-success"><p>Import process completed successfully!</p></div>';
+function totosync_enqueue_scripts( $hook ) {
+    if ( $hook !== 'toplevel_page_totosync' ) {
+        return;
     }
+    wp_enqueue_script(
+        'totosync-admin',
+        plugin_dir_url( __FILE__ ) . 'script.js',
+        [ 'jquery' ],
+        TOTOSYNC_VERSION,
+        true
+    );
+    wp_localize_script( 'totosync-admin', 'totosyncAdmin', [
+        'ajaxurl' => admin_url( 'admin-ajax.php' ),
+        'nonce'   => wp_create_nonce( 'totosync_nonce' ),
+    ] );
+}
+
+function totosync_page() {
+    $last_sync = get_option( TOTOSYNC_LAST_OPT );
+    $log       = get_option( TOTOSYNC_LOG_OPT, [] );
+    $next_cron = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
+
+    echo '<div class="wrap">';
+    echo '<h1>ToToSync &mdash; WooCommerce Product Sync</h1>';
+
+    // ── Status card ──────────────────────────────────────────────────────────
+    echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+       . 'margin-bottom:20px;border-radius:4px;max-width:660px;">';
+    echo '<h2 style="margin-top:0">Status</h2>';
+
+    echo '<p><strong>Last sync:</strong> '
+       . ( $last_sync
+           ? esc_html( date_i18n( 'D, d M Y H:i:s', $last_sync ) )
+           : '<em>Never run yet</em>' )
+       . '</p>';
+
+    if ( $next_cron ) {
+        echo '<p><strong>Next auto-sync:</strong> '
+           . esc_html( date_i18n( 'D, d M Y H:i:s', $next_cron ) )
+           . ' &nbsp;<span style="color:#888">(runs every 30 min)</span></p>';
+    } else {
+        echo '<p><strong>Next auto-sync:</strong> '
+           . '<span style="color:red">Not scheduled &mdash; deactivate &amp; reactivate the plugin.</span></p>';
+    }
+
+    echo '<p><strong>API:</strong><br><code>' . esc_html( TOTOSYNC_API_URL ) . '</code></p>';
+
+    echo '<p style="color:#777;font-size:12px;margin-bottom:0;">'
+       . 'For 100% reliable background syncs add a real server cron (recommended):<br>'
+       . '<code>*/30 * * * * curl -s ' . esc_url( site_url( '/wp-cron.php?doing_wp_cron' ) )
+       . ' &gt;/dev/null 2&gt;&amp;1</code></p>';
+
     echo '</div>';
 
-    // Add progress bar
-    echo '<div id="progress-bar-container">';
-    echo '<progress id="progress-bar" max="100" value="0"></progress>';
+    // ── Manual sync ──────────────────────────────────────────────────────────
+    echo '<div style="max-width:660px;">';
+    echo '<button id="totosync-btn" class="button button-primary" '
+       . 'style="height:36px;padding:0 20px;font-size:14px;">Sync Now</button>';
+    echo '<span id="totosync-spinner" class="spinner" '
+       . 'style="float:none;margin:4px 0 0 8px;vertical-align:middle;visibility:hidden;"></span>';
+
+    echo '<div id="totosync-progress-wrap" style="margin-top:14px;display:none;">';
+    echo '<progress id="totosync-progress" value="0" max="100" '
+       . 'style="width:100%;height:22px;display:block;"></progress>';
+    echo '<p id="totosync-label" style="margin:4px 0 0;color:#555;font-size:12px;"></p>';
     echo '</div>';
+
+    echo '<div id="totosync-result" style="margin-top:12px;"></div>';
+    echo '</div>';
+
+    // ── Sync log ─────────────────────────────────────────────────────────────
+    if ( ! empty( $log ) ) {
+        echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+           . 'margin-top:24px;border-radius:4px;max-width:660px;">';
+        echo '<h2 style="margin-top:0">Last Sync Log</h2>';
+        echo '<ul style="max-height:300px;overflow-y:auto;padding-left:20px;margin:0;">';
+        foreach ( $log as $entry ) {
+            $type  = $entry['type'] ?? 'info';
+            $color = $type === 'error' ? '#c00' : ( $type === 'warning' ? '#996600' : '#333' );
+            echo '<li style="color:' . $color . ';margin-bottom:3px;">'
+               . esc_html( $entry['message'] ) . '</li>';
+        }
+        echo '</ul>';
+        echo '</div>';
+    }
+
+    echo '</div>'; // .wrap
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AJAX handler — batched manual sync
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_ajax_handler() {
+    check_ajax_referer( 'totosync_nonce', 'nonce' );
+
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized', 403 );
+    }
+
+    $offset     = isset( $_POST['offset'] )     ? absint( $_POST['offset'] )     : 0;
+    $batch_size = isset( $_POST['batch_size'] ) ? absint( $_POST['batch_size'] ) : 10;
+
+    $cache_key = 'totosync_data_' . get_current_user_id();
+
+    if ( $offset === 0 ) {
+        // First batch: fetch fresh data and cache it for subsequent batches.
+        $products = totosync_fetch_products();
+        if ( is_wp_error( $products ) ) {
+            wp_send_json_error( $products->get_error_message() );
+        }
+        set_transient( $cache_key, $products, HOUR_IN_SECONDS );
+    } else {
+        $products = get_transient( $cache_key );
+        if ( $products === false ) {
+            wp_send_json_error( 'Session expired — please start the sync again.' );
+        }
+    }
+
+    $total   = count( $products );
+    $chunk   = array_slice( $products, $offset, $batch_size );
+    $results = [];
+
+    foreach ( $chunk as $item ) {
+        $results[] = totosync_process_product( $item );
+    }
+
+    $done = ( $offset + $batch_size ) >= $total;
+
+    if ( $done ) {
+        delete_transient( $cache_key );
+        update_option( TOTOSYNC_LAST_OPT, time() );
+        $log = array_merge(
+            [ [ 'type' => 'info', 'message' => 'Manual sync completed at ' . date( 'Y-m-d H:i:s' ) . ' — ' . $total . ' products' ] ],
+            $results
+        );
+        update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
+    }
+
+    wp_send_json_success( [
+        'total'   => $total,
+        'offset'  => $offset,
+        'done'    => $done,
+        'results' => $results,
+    ] );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cron — automatic sync every 30 minutes
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_run_sync() {
+    $products = totosync_fetch_products();
+    if ( is_wp_error( $products ) ) {
+        error_log( '[ToToSync] API fetch failed: ' . $products->get_error_message() );
+        return;
+    }
+
+    $log = [ [
+        'type'    => 'info',
+        'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . count( $products ) . ' products)',
+    ] ];
+
+    foreach ( $products as $item ) {
+        $log[] = totosync_process_product( $item );
+    }
+
+    update_option( TOTOSYNC_LAST_OPT, time() );
+    update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
+    error_log( '[ToToSync] Auto-sync done. ' . count( $products ) . ' products processed.' );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API fetch
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_fetch_products() {
+    $response = wp_remote_get( TOTOSYNC_API_URL, [
+        'timeout'    => 30,
+        'user-agent' => 'ToToSync/' . TOTOSYNC_VERSION,
+    ] );
+
+    if ( is_wp_error( $response ) ) {
+        return $response;
+    }
+
+    $code = (int) wp_remote_retrieve_response_code( $response );
+    if ( $code !== 200 ) {
+        return new WP_Error( 'http_error', "API returned HTTP {$code}" );
+    }
+
+    $body = wp_remote_retrieve_body( $response );
+    $data = json_decode( $body, true );
+
+    if ( ! is_array( $data ) ) {
+        return new WP_Error( 'parse_error', 'API response is not a valid JSON array' );
+    }
+
+    return $data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Product processing — entry point per item
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_process_product( array $item ) {
+    $name        = trim( $item['itemName']        ?? '' );
+    $sku         = trim( $item['itemCode']        ?? '' );
+    $colour      = trim( $item['colour']          ?? '' );
+    $measurement = trim( $item['measurement']     ?? '' );
+    $price       = (float) ( $item['price1']      ?? 0 );
+    $qty         = (int)   ( $item['quantity']    ?? 0 );
+    $category    = trim( $item['productCategory'] ?? '' );
+    $description = trim( $item['description']     ?? $name );
+    $raw_images  = $item['imageUrls']             ?? [];
+
+    if ( empty( $name ) ) {
+        return [ 'type' => 'warning', 'message' => "Item #{$item['itemId']} has no name — skipped." ];
+    }
+
+    // Transform / filter image URLs:
+    //   ftp://197.248.x.x/...  → http://197.248.x.x/...   (public IP, downloadable)
+    //   ftp://192.168.x.x/...  → skipped                  (private IP, unreachable)
+    //   http(s)://...          → kept as-is
+    $images = [];
+    foreach ( $raw_images as $url ) {
+        $clean = totosync_transform_image_url( $url );
+        if ( $clean ) {
+            $images[] = $clean;
+        }
+    }
+
+    try {
+        if ( $colour !== '' && $measurement !== '' ) {
+            return totosync_sync_variable(
+                $name, $sku, $colour, $measurement,
+                $price, $qty, $category, $description, $images
+            );
+        } else {
+            return totosync_sync_simple(
+                $name, $sku, $price, $qty, $category, $description, $images
+            );
+        }
+    } catch ( Throwable $e ) {
+        error_log( '[ToToSync] Exception for SKU ' . $sku . ': ' . $e->getMessage() );
+        return [ 'type' => 'error', 'message' => "SKU {$sku}: " . $e->getMessage() ];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Variable product + variation sync
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_sync_variable(
+    $name, $sku, $colour, $measurement,
+    $price, $qty, $category, $description, $images
+) {
+    // 1. Get or create the parent variable product.
+    $parent_id = totosync_get_or_create_parent( $name, $category, $description );
+    if ( ! $parent_id ) {
+        return [ 'type' => 'error', 'message' => "Could not create parent product for '{$name}'" ];
+    }
+
+    // 2. Ensure global WooCommerce attribute taxonomies exist.
+    $colour_attr_id      = totosync_ensure_wc_attribute( 'colour',      'Colour' );
+    $measurement_attr_id = totosync_ensure_wc_attribute( 'measurement', 'Measurement' );
+
+    // 3. Get or create the taxonomy terms for this specific colour/measurement.
+    $colour_term_id      = totosync_ensure_term( 'pa_colour',      $colour );
+    $measurement_term_id = totosync_ensure_term( 'pa_measurement', $measurement );
+
+    // 4. Register both attribute + term with the parent product object.
+    totosync_add_term_to_parent( $parent_id, 'pa_colour',      $colour_attr_id,      $colour_term_id );
+    totosync_add_term_to_parent( $parent_id, 'pa_measurement', $measurement_attr_id, $measurement_term_id );
+
+    // 5. Parent image (only if not already set).
+    if ( ! has_post_thumbnail( $parent_id ) && ! empty( $images ) ) {
+        totosync_attach_image( $parent_id, $images[0] );
+    }
+
+    // 6. Create or update the variation.
+    $variation_id = totosync_get_or_create_variation(
+        $parent_id,
+        $colour,      $colour_term_id,
+        $measurement, $measurement_term_id,
+        $sku, $price, $qty, $description
+    );
+
+    if ( ! $variation_id ) {
+        return [ 'type' => 'error', 'message' => "Could not create variation for SKU {$sku}" ];
+    }
+
+    // 7. Variation image (only if not already set).
+    if ( ! has_post_thumbnail( $variation_id ) && ! empty( $images ) ) {
+        totosync_attach_image( $variation_id, $images[0] );
+    }
+
+    // Bust the parent's cached price range so WooCommerce recalculates it.
+    wc_delete_product_transients( $parent_id );
+
+    $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
+    return [
+        'type'    => 'success',
+        'message' => "Synced variation SKU {$sku} ({$colour} / {$measurement}, {$stock_msg}) under '{$name}'",
+    ];
+}
+
+/**
+ * Get an existing variable parent product or create a new one.
+ * Products are keyed by a custom meta _totosync_item_name so lookups
+ * are SKU-safe even when the same item name appears across many variations.
+ */
+function totosync_get_or_create_parent( $name, $category, $description ) {
+    $found = get_posts( [
+        'post_type'      => 'product',
+        'post_status'    => 'any',
+        'posts_per_page' => 1,
+        'fields'         => 'ids',
+        'meta_query'     => [ [ 'key' => '_totosync_item_name', 'value' => $name ] ],
+    ] );
+
+    $cat_id = totosync_get_or_create_category( $category );
+
+    if ( ! empty( $found ) ) {
+        // Update category in case it changed.
+        $product = wc_get_product( $found[0] );
+        if ( $product ) {
+            $product->set_category_ids( [ $cat_id ] );
+            $product->save();
+        }
+        return (int) $found[0];
+    }
+
+    $product = new WC_Product_Variable();
+    $product->set_name( $name );
+    $product->set_description( $description );
+    $product->set_status( 'publish' );
+    $product->set_category_ids( [ $cat_id ] );
+    $id = $product->save();
+
+    if ( $id ) {
+        update_post_meta( $id, '_totosync_item_name', $name );
+    }
+
+    return $id ?: false;
+}
+
+/**
+ * Ensure a WooCommerce global attribute taxonomy exists (e.g. pa_colour).
+ * Returns the attribute ID.
+ */
+function totosync_ensure_wc_attribute( $slug, $label ) {
+    global $wpdb;
+
+    $row = $wpdb->get_row( $wpdb->prepare(
+        "SELECT attribute_id FROM {$wpdb->prefix}woocommerce_attribute_taxonomies WHERE attribute_name = %s",
+        $slug
+    ) );
+
+    if ( $row ) {
+        return (int) $row->attribute_id;
+    }
+
+    $result = wc_create_attribute( [
+        'name'         => $label,
+        'slug'         => $slug,
+        'type'         => 'select',
+        'order_by'     => 'menu_order',
+        'has_archives' => false,
+    ] );
+
+    if ( is_wp_error( $result ) ) {
+        error_log( '[ToToSync] Failed to create WC attribute "' . $slug . '": ' . $result->get_error_message() );
+        return 0;
+    }
+
+    // Make the taxonomy usable in the current PHP request without a reload.
+    register_taxonomy( 'pa_' . $slug, [ 'product', 'product_variation' ] );
+    delete_transient( 'wc_attribute_taxonomies' );
+
+    return (int) $result;
+}
+
+/**
+ * Ensure a taxonomy term exists. Returns the term ID.
+ */
+function totosync_ensure_term( $taxonomy, $value ) {
+    $slug = sanitize_title( $value );
+    $term = get_term_by( 'slug', $slug, $taxonomy );
+    if ( $term ) {
+        return (int) $term->term_id;
+    }
+
+    $result = wp_insert_term( $value, $taxonomy, [ 'slug' => $slug ] );
+    if ( is_wp_error( $result ) ) {
+        // Term may already exist under a slightly different slug.
+        $existing = get_term_by( 'name', $value, $taxonomy );
+        return $existing ? (int) $existing->term_id : 0;
+    }
+
+    return (int) $result['term_id'];
+}
+
+/**
+ * Add a term to a parent variable product's attribute definition.
+ * Uses the proper WC_Product_Attribute API so WooCommerce shows the
+ * correct attribute options on the product page.
+ */
+function totosync_add_term_to_parent( $parent_id, $taxonomy, $attr_id, $term_id ) {
+    if ( ! $term_id ) {
+        return;
+    }
+
+    $product    = wc_get_product( $parent_id );
+    if ( ! $product ) {
+        return;
+    }
+
+    $attributes = $product->get_attributes();
+    $changed    = false;
+
+    if ( isset( $attributes[ $taxonomy ] ) ) {
+        $attr    = $attributes[ $taxonomy ];
+        $options = $attr->get_options();
+        if ( ! in_array( $term_id, $options, true ) ) {
+            $options[] = $term_id;
+            $attr->set_options( $options );
+            $attributes[ $taxonomy ] = $attr;
+            $changed = true;
+        }
+    } else {
+        $attr = new WC_Product_Attribute();
+        $attr->set_id( $attr_id );
+        $attr->set_name( $taxonomy );
+        $attr->set_options( [ $term_id ] );
+        $attr->set_visible( true );
+        $attr->set_variation( true );
+        $attributes[ $taxonomy ] = $attr;
+        $changed = true;
+    }
+
+    if ( $changed ) {
+        $product->set_attributes( $attributes );
+        $product->save();
+    }
+}
+
+/**
+ * Create or update a product variation.
+ * Lookup order: SKU → matching attributes on existing children → create new.
+ * Returns the variation ID or false.
+ */
+function totosync_get_or_create_variation(
+    $parent_id,
+    $colour,      $colour_term_id,
+    $measurement, $measurement_term_id,
+    $sku, $price, $qty, $description
+) {
+    // Try to find by SKU (most reliable, avoids duplicates).
+    $variation_id = $sku ? wc_get_product_id_by_sku( $sku ) : 0;
+
+    if ( $variation_id ) {
+        $variation = wc_get_product( $variation_id );
+        if ( $variation && $variation->is_type( 'variation' ) ) {
+            $variation->set_regular_price( $price );
+            $variation->set_description( $description );
+            totosync_set_stock( $variation, $qty );
+            $variation->save();
+            totosync_write_variation_attrs( $variation_id, $colour, $measurement );
+            return $variation_id;
+        }
+    }
+
+    // Fall back: scan existing children for matching colour + measurement.
+    $parent = wc_get_product( $parent_id );
+    if ( $parent && $parent->is_type( 'variable' ) ) {
+        foreach ( $parent->get_children() as $child_id ) {
+            $child = wc_get_product( $child_id );
+            if ( ! $child ) {
+                continue;
+            }
+            if ( strtolower( trim( $child->get_attribute( 'pa_colour' ) ) )      === strtolower( $colour ) &&
+                 strtolower( trim( $child->get_attribute( 'pa_measurement' ) ) ) === strtolower( $measurement ) ) {
+                $child->set_regular_price( $price );
+                $child->set_sku( $sku );
+                $child->set_description( $description );
+                totosync_set_stock( $child, $qty );
+                $child->save();
+                totosync_write_variation_attrs( $child_id, $colour, $measurement );
+                return $child_id;
+            }
+        }
+    }
+
+    // Create a new variation.
+    $variation = new WC_Product_Variation();
+    $variation->set_parent_id( $parent_id );
+    $variation->set_sku( $sku );
+    $variation->set_regular_price( $price );
+    $variation->set_description( $description );
+    totosync_set_stock( $variation, $qty );
+    $new_id = $variation->save();
+
+    if ( $new_id ) {
+        totosync_write_variation_attrs( $new_id, $colour, $measurement );
+    }
+
+    return $new_id ?: false;
+}
+
+/**
+ * Set stock quantity, status, and management on a WC product object.
+ * If qty = 0 the variation will appear as "Out of stock" — customers
+ * cannot add it to their cart until stock is replenished.
+ */
+function totosync_set_stock( WC_Product $product, $qty ) {
+    $product->set_manage_stock( true );
+    $product->set_stock_quantity( $qty );
+    $product->set_stock_status( $qty > 0 ? 'instock' : 'outofstock' );
+    $product->set_backorders( 'no' );
+}
+
+/**
+ * Write the attribute slug postmeta that WooCommerce reads to
+ * display and match variation attributes on the product page.
+ */
+function totosync_write_variation_attrs( $variation_id, $colour, $measurement ) {
+    update_post_meta( $variation_id, 'attribute_pa_colour',      sanitize_title( $colour ) );
+    update_post_meta( $variation_id, 'attribute_pa_measurement', sanitize_title( $measurement ) );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple product sync
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_sync_simple( $name, $sku, $price, $qty, $category, $description, $images ) {
+    $cat_id     = totosync_get_or_create_category( $category );
+    $product_id = $sku ? wc_get_product_id_by_sku( $sku ) : 0;
+
+    if ( ! $product_id ) {
+        // Fallback: look up by our custom meta.
+        $found = get_posts( [
+            'post_type'      => 'product',
+            'post_status'    => 'any',
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => [ [ 'key' => '_totosync_item_name', 'value' => $name ] ],
+        ] );
+        if ( ! empty( $found ) ) {
+            $product_id = (int) $found[0];
+        }
+    }
+
+    if ( $product_id ) {
+        $product = wc_get_product( $product_id );
+        if ( $product ) {
+            $product->set_name( $name );
+            $product->set_sku( $sku );
+            $product->set_regular_price( $price );
+            $product->set_description( $description );
+            $product->set_category_ids( [ $cat_id ] );
+            totosync_set_stock( $product, $qty );
+            $product->save();
+
+            if ( ! has_post_thumbnail( $product_id ) && ! empty( $images ) ) {
+                totosync_attach_image( $product_id, $images[0] );
+            }
+
+            $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
+            return [ 'type' => 'success', 'message' => "Updated simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
+        }
+    }
+
+    // Create new simple product.
+    $product = new WC_Product_Simple();
+    $product->set_name( $name );
+    $product->set_sku( $sku );
+    $product->set_regular_price( $price );
+    $product->set_description( $description );
+    $product->set_category_ids( [ $cat_id ] );
+    $product->set_status( 'publish' );
+    totosync_set_stock( $product, $qty );
+    $new_id = $product->save();
+
+    if ( $new_id ) {
+        update_post_meta( $new_id, '_totosync_item_name', $name );
+        if ( ! empty( $images ) ) {
+            totosync_attach_image( $new_id, $images[0] );
+        }
+    }
+
+    $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
+    return [ 'type' => 'success', 'message' => "Created simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Category helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+function totosync_get_or_create_category( $name ) {
+    if ( empty( $name ) ) {
+        return 0;
+    }
+    $term = get_term_by( 'name', $name, 'product_cat' );
+    if ( $term ) {
+        return (int) $term->term_id;
+    }
+    $result = wp_insert_term( $name, 'product_cat' );
+    return is_wp_error( $result ) ? 0 : (int) $result['term_id'];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image URL transformation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Transform a raw image URL from the POS API:
+ *
+ *   ftp://197.248.191.179/items_images/foo.png  →  http://197.248.191.179/items_images/foo.png
+ *   ftp://192.168.0.30/items_images/foo.png     →  false   (private IP — skip image, keep product)
+ *   http://197.248.191.179/foo.png              →  returned as-is
+ *
+ * Products whose imageUrls are ALL private/unreachable are still synced
+ * to WooCommerce, just without a featured image.
+ *
+ * @param  string $url Raw URL from the API.
+ * @return string|false Transformed URL ready for download, or false to skip.
+ */
+function totosync_transform_image_url( $url ) {
+    if ( empty( $url ) ) {
+        return false;
+    }
+
+    $parsed = parse_url( $url );
+    $scheme = strtolower( $parsed['scheme'] ?? '' );
+    $host   = $parsed['host'] ?? '';
+    $path   = $parsed['path'] ?? '/';
+
+    // Any private / reserved / loopback address → skip the image.
+    if ( totosync_is_private_host( $host ) ) {
+        return false;
+    }
+
+    if ( $scheme === 'ftp' ) {
+        // Serve the file over HTTP from the public POS IP.
+        return 'http://' . $host . $path;
+    }
+
+    if ( in_array( $scheme, [ 'http', 'https' ], true ) ) {
+        return $url;
+    }
+
+    return false; // Unknown or unsupported scheme.
+}
+
+/**
+ * Returns true when $host is a private, loopback, or link-local IP address
+ * (e.g. 192.168.x.x, 10.x.x.x, 172.16-31.x.x, 127.x.x.x, 169.254.x.x).
+ * Hostnames (not raw IPs) are assumed public and return false.
+ */
+function totosync_is_private_host( $host ) {
+    if ( empty( $host ) ) {
+        return true;
+    }
+
+    // Only raw IP addresses are checked; DNS names are treated as public.
+    if ( filter_var( $host, FILTER_VALIDATE_IP ) === false ) {
+        return false;
+    }
+
+    // Returns false when the IP IS private/reserved → meaning it IS private.
+    return filter_var(
+        $host,
+        FILTER_VALIDATE_IP,
+        FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+    ) === false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image download and attachment
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Download $url and attach it as the featured image of $post_id.
+ * Uses WordPress's native media_handle_sideload() so all metadata,
+ * thumbnails, and MIME detection are handled automatically.
+ *
+ * @param  int    $post_id Attachment parent (product or variation).
+ * @param  string $url     Fully qualified HTTP/HTTPS URL.
+ * @return int|false Attachment ID on success, false on failure.
+ */
+function totosync_attach_image( $post_id, $url ) {
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    $tmp = download_url( $url );
+    if ( is_wp_error( $tmp ) ) {
+        error_log( '[ToToSync] download_url failed (' . $url . '): ' . $tmp->get_error_message() );
+        return false;
+    }
+
+    $file_array = [
+        'name'     => sanitize_file_name( basename( parse_url( $url, PHP_URL_PATH ) ) ),
+        'tmp_name' => $tmp,
+    ];
+
+    $attachment_id = media_handle_sideload( $file_array, $post_id );
+
+    // Always clean up the temp file even if sideload failed.
+    if ( file_exists( $tmp ) ) {
+        @unlink( $tmp );
+    }
+
+    if ( is_wp_error( $attachment_id ) ) {
+        error_log( '[ToToSync] media_handle_sideload failed: ' . $attachment_id->get_error_message() );
+        return false;
+    }
+
+    set_post_thumbnail( $post_id, $attachment_id );
+    return $attachment_id;
 }
