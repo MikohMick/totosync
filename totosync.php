@@ -211,11 +211,19 @@ function totosync_ajax_handler() {
     $done = ( $offset + $batch_size ) >= $total;
 
     if ( $done ) {
+        // Trash products / variations that have disappeared from the API.
+        $api_skus  = array_values( array_filter( array_map(
+            fn( $item ) => trim( $item['itemCode'] ?? '' ),
+            $products
+        ) ) );
+        $trash_log = totosync_trash_removed( $api_skus );
+
         delete_transient( $cache_key );
         update_option( TOTOSYNC_LAST_OPT, time() );
         $log = array_merge(
             [ [ 'type' => 'info', 'message' => 'Manual sync completed at ' . date( 'Y-m-d H:i:s' ) . ' — ' . $total . ' products' ] ],
-            $results
+            $results,
+            $trash_log
         );
         update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
     }
@@ -247,6 +255,13 @@ function totosync_run_sync() {
     foreach ( $products as $item ) {
         $log[] = totosync_process_product( $item );
     }
+
+    // Trash products / variations that have disappeared from the API.
+    $api_skus = array_values( array_filter( array_map(
+        fn( $item ) => trim( $item['itemCode'] ?? '' ),
+        $products
+    ) ) );
+    $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
 
     update_option( TOTOSYNC_LAST_OPT, time() );
     update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
@@ -405,10 +420,11 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
     $cat_id = totosync_get_or_create_category( $category );
 
     if ( ! empty( $found ) ) {
-        // Update category in case it changed.
+        // Update category; restore from trash if it was removed previously.
         $product = wc_get_product( $found[0] );
         if ( $product ) {
             $product->set_category_ids( [ $cat_id ] );
+            $product->set_status( 'publish' );
             $product->save();
         }
         return (int) $found[0];
@@ -547,6 +563,7 @@ function totosync_get_or_create_variation(
         if ( $variation && $variation->is_type( 'variation' ) ) {
             $variation->set_regular_price( $price );
             $variation->set_description( $description );
+            $variation->set_status( 'publish' ); // Restore if previously trashed.
             totosync_set_stock( $variation, $qty );
             $variation->save();
             totosync_write_variation_attrs( $variation_id, $colour, $measurement );
@@ -567,6 +584,7 @@ function totosync_get_or_create_variation(
                 $child->set_regular_price( $price );
                 $child->set_sku( $sku );
                 $child->set_description( $description );
+                $child->set_status( 'publish' ); // Restore if previously trashed.
                 totosync_set_stock( $child, $qty );
                 $child->save();
                 totosync_write_variation_attrs( $child_id, $colour, $measurement );
@@ -642,6 +660,7 @@ function totosync_sync_simple( $name, $sku, $price, $qty, $category, $descriptio
             $product->set_regular_price( $price );
             $product->set_description( $description );
             $product->set_category_ids( [ $cat_id ] );
+            $product->set_status( 'publish' ); // Restore if previously trashed.
             totosync_set_stock( $product, $qty );
             $product->save();
 
@@ -700,12 +719,14 @@ function totosync_get_or_create_category( $name ) {
  * Transform a raw image URL from the POS API:
  *
  *   ftp://197.248.191.179/items_images/foo.png  →  http://197.248.191.179/items_images/foo.png
- *   ftp://192.168.0.30/items_images/foo.png     →  http://197.248.191.179/items_images/foo.png
- *     (private IP rewritten to known public POS IP — handles transition from 192.x → 197.x)
+ *   ftp://192.168.0.30/items_images/foo.png     →  false   (private IP — skip image, keep product)
  *   http://197.248.191.179/foo.png              →  returned as-is
  *
  * Products whose imageUrls are ALL private/unreachable are still synced
- * to WooCommerce, just without a featured image.
+ * to WooCommerce without a featured image. On the next cron run, once the
+ * POS server is reachable at a public URL (e.g. after moving from 192.x to
+ * 197.x), the image will be attached automatically because we only skip
+ * setting a thumbnail when one already exists.
  *
  * @param  string $url Raw URL from the API.
  * @return string|false Transformed URL ready for download, or false to skip.
@@ -720,11 +741,11 @@ function totosync_transform_image_url( $url ) {
     $host   = $parsed['host'] ?? '';
     $path   = $parsed['path'] ?? '/';
 
-    // Private / reserved / loopback address — rewrite to the known public POS IP
-    // so images previously served on the local network (e.g. 192.168.x.x) are
-    // still fetched after the server moves to its public address (TOTOSYNC_POS_IP).
+    // Any private / reserved / loopback address → skip the image.
+    // The product is still synced; the thumbnail will be attached on the next
+    // sync run once the API starts returning a reachable public-IP URL.
     if ( totosync_is_private_host( $host ) ) {
-        $host = TOTOSYNC_POS_IP;
+        return false;
     }
 
     if ( $scheme === 'ftp' ) {
@@ -733,8 +754,7 @@ function totosync_transform_image_url( $url ) {
     }
 
     if ( in_array( $scheme, [ 'http', 'https' ], true ) ) {
-        // If host was rewritten, rebuild the URL with the public IP.
-        return $scheme . '://' . $host . $path;
+        return $url;
     }
 
     return false; // Unknown or unsupported scheme.
@@ -806,4 +826,107 @@ function totosync_attach_image( $post_id, $url ) {
 
     set_post_thumbnail( $post_id, $attachment_id );
     return $attachment_id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trash products / variations removed from the API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * After a full sync, trash any WooCommerce product or variation that was
+ * previously created by ToToSync but is no longer present in the API response.
+ *
+ * - Simple products: trashed when their SKU is absent from the API.
+ * - Variations:      trashed when their SKU is absent from the API.
+ * - Variable parent: trashed only when every one of its variations has been
+ *                    trashed (no live children remain).
+ *
+ * Restoration is automatic: the next time a trashed item's SKU reappears in
+ * the API the regular sync code finds it (post_status = 'any'), sets its
+ * status back to 'publish', and restores its stock level.
+ *
+ * @param  string[] $api_skus All itemCode values seen in the current API response.
+ * @return array[]  Log entries (type/message) for every trashed item.
+ */
+function totosync_trash_removed( array $api_skus ) {
+    // Guard: if the API returned nothing, don't nuke the whole catalogue.
+    if ( empty( $api_skus ) ) {
+        return [];
+    }
+
+    $log     = [];
+    $api_set = array_flip( $api_skus ); // O(1) SKU lookup.
+
+    // All products managed by ToToSync (both simple and variable parents).
+    $managed_ids = get_posts( [
+        'post_type'      => 'product',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+        'meta_query'     => [ [ 'key' => '_totosync_item_name' ] ],
+    ] );
+
+    foreach ( $managed_ids as $pid ) {
+        $product = wc_get_product( $pid );
+        if ( ! $product ) {
+            continue;
+        }
+
+        // ── Simple product ────────────────────────────────────────────────────
+        if ( $product->is_type( 'simple' ) ) {
+            $sku = $product->get_sku();
+            if ( $sku !== '' && ! isset( $api_set[ $sku ] ) ) {
+                wp_trash_post( $pid );
+                $log[] = [
+                    'type'    => 'info',
+                    'message' => "Trashed simple product SKU {$sku} '{$product->get_name()}' (removed from API)",
+                ];
+            }
+            continue;
+        }
+
+        // ── Variable product — check each variation ───────────────────────────
+        if ( $product->is_type( 'variable' ) ) {
+            $has_live = false;
+
+            // Query all children including any already-trashed ones.
+            $children = get_posts( [
+                'post_type'      => 'product_variation',
+                'post_parent'    => $pid,
+                'post_status'    => 'publish',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ] );
+
+            foreach ( $children as $var_id ) {
+                $variation = wc_get_product( $var_id );
+                if ( ! $variation ) {
+                    continue;
+                }
+                $sku = $variation->get_sku();
+
+                if ( $sku === '' || isset( $api_set[ $sku ] ) ) {
+                    // Unknown SKU or still present — treat as live.
+                    $has_live = true;
+                } else {
+                    wp_trash_post( $var_id );
+                    $log[] = [
+                        'type'    => 'info',
+                        'message' => "Trashed variation SKU {$sku} under '{$product->get_name()}' (removed from API)",
+                    ];
+                }
+            }
+
+            // Trash the parent only when no live variations remain.
+            if ( ! $has_live ) {
+                wp_trash_post( $pid );
+                $log[] = [
+                    'type'    => 'info',
+                    'message' => "Trashed parent product '{$product->get_name()}' (all variations removed from API)",
+                ];
+            }
+        }
+    }
+
+    return $log;
 }
