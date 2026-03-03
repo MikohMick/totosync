@@ -2,25 +2,33 @@
 jQuery( function ( $ ) {
     'use strict';
 
-    var $btn     = $( '#totosync-btn' );
-    var $spinner = $( '#totosync-spinner' );
-    var $status  = $( '#totosync-status' );
-    var $result  = $( '#totosync-result' );
+    var $btn        = $( '#totosync-btn' );
+    var $spinner    = $( '#totosync-spinner' );
+    var $progWrap   = $( '#totosync-progress-wrap' );
+    var $bar        = $( '#totosync-progress' );
+    var $barLabel   = $( '#totosync-progress-label' );
+    var $status     = $( '#totosync-status' );
+    var $result     = $( '#totosync-result' );
 
-    var pollTimer       = null;
-    var lastSyncBefore  = totosyncAdmin.last_sync;
-    var POLL_INTERVAL   = 5000; // ms
+    var pollTimer      = null;
+    var lastSyncBefore = totosyncAdmin.last_sync;
+    var POLL_INTERVAL  = 5000; // ms
 
-    // If a sync was already running when the page loaded, start polling immediately.
+    // If a sync was already running when the page loaded, restore the UI
+    // and start polling immediately so the page stays live.
     if ( totosyncAdmin.running ) {
-        setRunningUI( 'Sync is running in the background\u2026' );
+        setRunningUI();
+        if ( totosyncAdmin.progress ) {
+            updateBar( totosyncAdmin.progress );
+        }
         schedulePoll();
     }
 
     // ── Sync Now button ───────────────────────────────────────────────────────
     $btn.on( 'click', function () {
-        lastSyncBefore = totosyncAdmin.last_sync; // snapshot before starting
-        setRunningUI( 'Starting sync\u2026' );
+        lastSyncBefore = totosyncAdmin.last_sync;
+        setRunningUI();
+        $barLabel.text( 'Starting\u2026' );
 
         $.post( totosyncAdmin.ajaxurl, {
             action: 'totosync_start_sync',
@@ -33,19 +41,6 @@ jQuery( function ( $ ) {
             }
 
             lastSyncBefore = res.data.last_sync;
-
-            if ( res.data.already_running ) {
-                setStatus(
-                    'A sync is already running. Waiting for it to finish\u2026 ' +
-                    'You can safely navigate away.'
-                );
-            } else {
-                setStatus(
-                    'Sync started in the background. ' +
-                    'You can safely navigate away \u2014 this page updates automatically when done.'
-                );
-            }
-
             schedulePoll();
         } )
         .fail( function () {
@@ -66,41 +61,52 @@ jQuery( function ( $ ) {
         } )
         .done( function ( res ) {
             if ( ! res.success ) {
-                return; // Ignore transient errors; keep polling.
+                return; // Transient error — keep polling.
             }
 
             var d = res.data;
 
+            // Update progress bar whenever data is available.
+            if ( d.progress ) {
+                updateBar( d.progress );
+            }
+
             if ( ! d.running && d.last_sync > lastSyncBefore ) {
-                // Sync finished and last_sync timestamp advanced — success.
+                // Sync finished and last_sync advanced — done.
                 clearInterval( pollTimer );
+                $bar.val( 100 );
+                $barLabel.text( 'Done!' );
                 $result.html(
                     '<div class="notice notice-success inline" style="display:block;">' +
                     '<p>Sync complete! Reloading\u2026</p></div>'
                 );
-                setStatus( '' );
+                $status.empty();
                 resetUI();
                 setTimeout( function () { location.reload(); }, 1500 );
 
             } else if ( d.running ) {
-                // Still running — update the timestamp in the status message.
-                var ts = new Date().toLocaleTimeString();
-                setStatus(
-                    'Sync running in the background\u2026 (last checked ' + ts + '). ' +
-                    'You can safely navigate away.'
-                );
+                $status.text( 'Running in the background \u2014 you can safely navigate away.' );
             }
-            // If !running && last_sync hasn't changed, the sync hasn't started
-            // on the server yet — keep polling silently.
         } );
     }
 
+    // ── Progress bar ─────────────────────────────────────────────────────────
+    function updateBar( prog ) {
+        var pct = prog.total > 0 ? Math.round( ( prog.processed / prog.total ) * 100 ) : 0;
+        $progWrap.show();
+        $bar.val( pct );
+        $barLabel.text(
+            'Processing ' + prog.processed + ' / ' + prog.total +
+            ' products (' + pct + '%)'
+        );
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
-    function setRunningUI( msg ) {
+    function setRunningUI() {
         $btn.prop( 'disabled', true );
         $spinner.css( 'visibility', 'visible' );
         $result.empty();
-        setStatus( msg );
+        $progWrap.show();
     }
 
     function resetUI() {
@@ -108,17 +114,14 @@ jQuery( function ( $ ) {
         $spinner.css( 'visibility', 'hidden' );
     }
 
-    function setStatus( msg ) {
-        $status.html( msg );
-    }
-
     function showError( msg ) {
         clearInterval( pollTimer );
+        $progWrap.hide();
         $result.html(
             '<div class="notice notice-error inline" style="display:block;"><p>' +
             escHtml( msg ) + '</p></div>'
         );
-        setStatus( '' );
+        $status.empty();
         resetUI();
     }
 

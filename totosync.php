@@ -24,6 +24,7 @@ define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProduc
 define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
 define( 'TOTOSYNC_LAST_OPT',  'totosync_last_sync' );
+define( 'TOTOSYNC_PROG_KEY',  'totosync_progress' );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
@@ -93,11 +94,13 @@ function totosync_enqueue_scripts( $hook ) {
         TOTOSYNC_VERSION,
         true
     );
+    $prog = get_transient( TOTOSYNC_PROG_KEY );
     wp_localize_script( 'totosync-admin', 'totosyncAdmin', [
         'ajaxurl'   => admin_url( 'admin-ajax.php' ),
         'nonce'     => wp_create_nonce( 'totosync_nonce' ),
         'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
         'running'   => get_transient( 'totosync_running' ) ? true : false,
+        'progress'  => $prog ? $prog : null,
     ] );
 }
 
@@ -151,32 +154,52 @@ function totosync_page() {
     }
 
     // Cron mode row
+    $sync_php_path = __DIR__ . '/sync.php';
+    $php_bin       = defined( 'PHP_BINARY' ) && PHP_BINARY ? PHP_BINARY : 'php';
+    $cron_cmd      = '*/30 * * * * ' . $php_bin . ' ' . $sync_php_path
+                   . ' >> /var/log/totosync.log 2>&1';
+
     if ( $server_cron_mode ) {
         echo '<p style="margin:6px 0;font-size:13px;">'
            . '<strong>Cron mode:</strong> '
            . '<span style="color:#46b450;">&#10003; Server cron active</span>'
-           . ' &mdash; <code>DISABLE_WP_CRON</code> is set in <code>wp-config.php</code></p>';
+           . ' (<code>DISABLE_WP_CRON</code> is set in <code>wp-config.php</code>)</p>';
+
+        echo '<div style="font-size:12px;margin:8px 0 0;padding:10px 12px;'
+           . 'background:#f8f8f8;border:1px solid #ddd;border-radius:3px;">';
+        echo '<p style="margin:0 0 6px;"><strong>The green/grey dot above is how you know if cron is working.</strong> '
+           . 'WordPress cannot directly detect an OS cron job &mdash; but if the dot turns green '
+           . 'within 35 minutes of setup, your cron is firing correctly.</p>';
+        echo '<p style="margin:0 0 4px;"><strong>To verify your crontab is set, run in terminal:</strong></p>';
+        echo '<code style="display:block;word-break:break-all;padding:6px 8px;'
+           . 'background:#fff;border:1px solid #ddd;margin-bottom:8px;">'
+           . 'crontab -l</code>';
+        echo '<p style="margin:0 0 4px;"><strong>You should see this line (or similar):</strong></p>';
+        echo '<code style="display:block;word-break:break-all;padding:6px 8px;'
+           . 'background:#fff;border:1px solid #ddd;">'
+           . esc_html( $cron_cmd ) . '</code>';
+        echo '</div>';
     } else {
         echo '<p style="margin:6px 0;font-size:13px;">'
            . '<strong>Cron mode:</strong> WP-Cron (fires on page visits)';
         if ( $next_cron ) {
-            echo ' &mdash; next run in ~'
-               . human_time_diff( time(), $next_cron );
+            echo ' &mdash; next run in ~' . human_time_diff( time(), $next_cron );
         } else {
             echo ' &mdash; <span style="color:#dc3232;">not scheduled &mdash; '
                . 'deactivate &amp; reactivate the plugin</span>';
         }
         echo '</p>';
 
-        // Suggest server cron if not already using it
-        echo '<p style="color:#777;font-size:12px;margin:8px 0 0;padding:8px;'
-           . 'background:#f8f8f8;border-left:3px solid #ffb900;">'
-           . '<strong>Tip:</strong> For reliable background syncs, '
-           . 'add <code>define(\'DISABLE_WP_CRON\', true);</code> to <code>wp-config.php</code> '
-           . 'and add a server cron:<br>'
-           . '<code style="word-break:break-all;">*/30 * * * * php '
-           . esc_html( WP_CONTENT_DIR . '/plugins/totosync/sync.php' )
-           . ' &gt;&gt; /var/log/totosync.log 2&gt;&amp;1</code></p>';
+        echo '<div style="font-size:12px;margin:8px 0 0;padding:10px 12px;'
+           . 'background:#fffbf0;border-left:3px solid #ffb900;">';
+        echo '<p style="margin:0 0 6px;"><strong>Recommended:</strong> Switch to a real server cron for reliable 30-minute syncs.</p>';
+        echo '<p style="margin:0 0 4px;">1. Add to <code>wp-config.php</code> (above the "stop editing" line):</p>';
+        echo '<code style="display:block;padding:6px 8px;background:#fff;border:1px solid #ddd;margin-bottom:8px;">'
+           . "define( 'DISABLE_WP_CRON', true );</code>";
+        echo '<p style="margin:0 0 4px;">2. Run <code>crontab -e</code> and add:</p>';
+        echo '<code style="display:block;word-break:break-all;padding:6px 8px;background:#fff;border:1px solid #ddd;">'
+           . esc_html( $cron_cmd ) . '</code>';
+        echo '</div>';
     }
 
     echo '<p style="margin:10px 0 0;font-size:13px;">'
@@ -186,7 +209,9 @@ function totosync_page() {
     echo '</div>';
 
     // ── Manual sync ──────────────────────────────────────────────────────────
-    echo '<div style="max-width:660px;">';
+    $init_prog = get_transient( TOTOSYNC_PROG_KEY );
+
+    echo '<div style="max-width:660px;margin-top:4px;">';
     echo '<button id="totosync-btn" class="button button-primary" '
        . 'style="height:36px;padding:0 20px;font-size:14px;"'
        . ( $sync_running ? ' disabled' : '' ) . '>Sync Now</button>';
@@ -194,10 +219,27 @@ function totosync_page() {
        . 'style="float:none;margin:4px 0 0 8px;vertical-align:middle;'
        . 'visibility:' . ( $sync_running ? 'visible' : 'hidden' ) . ';"></span>';
 
-    echo '<div id="totosync-status" style="margin-top:10px;font-size:13px;color:#555;">';
+    // Progress bar — shown immediately if a sync was in progress when the page loaded.
+    $bar_style = ( $sync_running && $init_prog ) ? '' : 'display:none;';
+    $bar_val   = $init_prog && $init_prog['total'] > 0
+                   ? round( $init_prog['processed'] / $init_prog['total'] * 100 )
+                   : 0;
+    $bar_label = $init_prog
+                   ? 'Processing ' . $init_prog['processed'] . ' / ' . $init_prog['total']
+                     . ' products (' . $bar_val . '%)'
+                   : '';
+
+    echo '<div id="totosync-progress-wrap" style="margin-top:14px;' . $bar_style . '">';
+    echo '<progress id="totosync-progress" value="' . $bar_val . '" max="100" '
+       . 'style="width:100%;height:20px;display:block;"></progress>';
+    echo '<p id="totosync-progress-label" style="margin:4px 0 0;color:#555;font-size:12px;">'
+       . esc_html( $bar_label ) . '</p>';
+    echo '</div>';
+
+    echo '<div id="totosync-status" style="margin-top:8px;font-size:13px;color:#555;">';
     if ( $sync_running ) {
-        echo 'Sync is running in the background. This page polls every 5 s &mdash; '
-           . 'you can also <a href="">refresh manually</a>.';
+        echo 'Sync is running in the background &mdash; you can safely navigate away. '
+           . 'This page updates automatically every 5 s, or <a href="">refresh manually</a>.';
     }
     echo '</div>';
 
@@ -304,9 +346,11 @@ function totosync_ajax_poll() {
         wp_send_json_error( 'Unauthorized', 403 );
     }
 
+    $prog = get_transient( TOTOSYNC_PROG_KEY );
     wp_send_json_success( [
         'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
         'running'   => (bool) get_transient( 'totosync_running' ),
+        'progress'  => $prog ? $prog : null,
     ] );
 }
 
@@ -321,13 +365,17 @@ function totosync_run_sync() {
         return;
     }
 
-    $log = [ [
+    $total = count( $products );
+    $log   = [ [
         'type'    => 'info',
-        'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . count( $products ) . ' products)',
+        'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' products)',
     ] ];
 
-    foreach ( $products as $item ) {
+    set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+
+    foreach ( $products as $i => $item ) {
         $log[] = totosync_process_product( $item );
+        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $i + 1, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
     }
 
     // Trash products / variations that have disappeared from the API.
@@ -337,9 +385,10 @@ function totosync_run_sync() {
     ) ) );
     $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
 
+    delete_transient( TOTOSYNC_PROG_KEY );
     update_option( TOTOSYNC_LAST_OPT, time() );
     update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
-    error_log( '[ToToSync] Auto-sync done. ' . count( $products ) . ' products processed.' );
+    error_log( '[ToToSync] Auto-sync done. ' . $total . ' products processed.' );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
