@@ -2,70 +2,105 @@
 jQuery( function ( $ ) {
     'use strict';
 
-    var BATCH     = 10;
-    var $btn      = $( '#totosync-btn' );
-    var $spinner  = $( '#totosync-spinner' );
-    var $wrap     = $( '#totosync-progress-wrap' );
-    var $bar      = $( '#totosync-progress' );
-    var $label    = $( '#totosync-label' );
-    var $result   = $( '#totosync-result' );
+    var $btn     = $( '#totosync-btn' );
+    var $spinner = $( '#totosync-spinner' );
+    var $status  = $( '#totosync-status' );
+    var $result  = $( '#totosync-result' );
 
+    var pollTimer       = null;
+    var lastSyncBefore  = totosyncAdmin.last_sync;
+    var POLL_INTERVAL   = 5000; // ms
+
+    // If a sync was already running when the page loaded, start polling immediately.
+    if ( totosyncAdmin.running ) {
+        setRunningUI( 'Sync is running in the background\u2026' );
+        schedulePoll();
+    }
+
+    // ── Sync Now button ───────────────────────────────────────────────────────
     $btn.on( 'click', function () {
-        $btn.prop( 'disabled', true );
-        $spinner.css( 'visibility', 'visible' );
-        $wrap.show();
-        $bar.val( 0 );
-        $label.text( 'Fetching products from API\u2026' );
-        $result.empty();
+        lastSyncBefore = totosyncAdmin.last_sync; // snapshot before starting
+        setRunningUI( 'Starting sync\u2026' );
 
-        runBatch( 0 );
-    } );
-
-    function runBatch( offset ) {
         $.post( totosyncAdmin.ajaxurl, {
-            action:     'totosync_sync',
-            nonce:      totosyncAdmin.nonce,
-            offset:     offset,
-            batch_size: BATCH,
+            action: 'totosync_start_sync',
+            nonce:  totosyncAdmin.nonce,
         } )
         .done( function ( res ) {
             if ( ! res.success ) {
-                showError( res.data || 'Unknown server error.' );
+                showError( res.data || 'Server error.' );
                 return;
             }
 
-            var d         = res.data;
-            var processed = Math.min( offset + BATCH, d.total );
-            var pct       = d.total > 0 ? Math.round( ( processed / d.total ) * 100 ) : 100;
+            lastSyncBefore = res.data.last_sync;
 
-            $bar.val( pct );
-            $label.text( 'Processing ' + processed + ' / ' + d.total + ' products (' + pct + '%)' );
+            if ( res.data.already_running ) {
+                setStatus(
+                    'A sync is already running. Waiting for it to finish\u2026 ' +
+                    'You can safely navigate away.'
+                );
+            } else {
+                setStatus(
+                    'Sync started in the background. ' +
+                    'You can safely navigate away \u2014 this page updates automatically when done.'
+                );
+            }
 
-            if ( d.done ) {
-                $bar.val( 100 );
-                $label.text( 'Done! All ' + d.total + ' products synced.' );
+            schedulePoll();
+        } )
+        .fail( function () {
+            showError( 'Could not reach the server. Please try again.' );
+        } );
+    } );
+
+    // ── Polling ───────────────────────────────────────────────────────────────
+    function schedulePoll() {
+        clearInterval( pollTimer );
+        pollTimer = setInterval( poll, POLL_INTERVAL );
+    }
+
+    function poll() {
+        $.post( totosyncAdmin.ajaxurl, {
+            action: 'totosync_poll',
+            nonce:  totosyncAdmin.nonce,
+        } )
+        .done( function ( res ) {
+            if ( ! res.success ) {
+                return; // Ignore transient errors; keep polling.
+            }
+
+            var d = res.data;
+
+            if ( ! d.running && d.last_sync > lastSyncBefore ) {
+                // Sync finished and last_sync timestamp advanced — success.
+                clearInterval( pollTimer );
                 $result.html(
                     '<div class="notice notice-success inline" style="display:block;">' +
-                    '<p>Sync complete. Reloading in 3 s to refresh the log\u2026</p></div>'
+                    '<p>Sync complete! Reloading\u2026</p></div>'
                 );
-                setTimeout( function () { location.reload(); }, 3000 );
+                setStatus( '' );
                 resetUI();
-            } else {
-                // Small pause between batches so we don't hammer the server.
-                setTimeout( function () { runBatch( offset + BATCH ); }, 400 );
+                setTimeout( function () { location.reload(); }, 1500 );
+
+            } else if ( d.running ) {
+                // Still running — update the timestamp in the status message.
+                var ts = new Date().toLocaleTimeString();
+                setStatus(
+                    'Sync running in the background\u2026 (last checked ' + ts + '). ' +
+                    'You can safely navigate away.'
+                );
             }
-        } )
-        .fail( function ( xhr, status, err ) {
-            showError( 'Request failed: ' + err );
+            // If !running && last_sync hasn't changed, the sync hasn't started
+            // on the server yet — keep polling silently.
         } );
     }
 
-    function showError( msg ) {
-        $result.html(
-            '<div class="notice notice-error inline" style="display:block;"><p>' +
-            escHtml( msg ) + '</p></div>'
-        );
-        resetUI();
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function setRunningUI( msg ) {
+        $btn.prop( 'disabled', true );
+        $spinner.css( 'visibility', 'visible' );
+        $result.empty();
+        setStatus( msg );
     }
 
     function resetUI() {
@@ -73,7 +108,20 @@ jQuery( function ( $ ) {
         $spinner.css( 'visibility', 'hidden' );
     }
 
-    // Minimal XSS-safe escaper for dynamic content inserted into the DOM.
+    function setStatus( msg ) {
+        $status.html( msg );
+    }
+
+    function showError( msg ) {
+        clearInterval( pollTimer );
+        $result.html(
+            '<div class="notice notice-error inline" style="display:block;"><p>' +
+            escHtml( msg ) + '</p></div>'
+        );
+        setStatus( '' );
+        resetUI();
+    }
+
     function escHtml( str ) {
         return $( '<span>' ).text( str ).html();
     }
