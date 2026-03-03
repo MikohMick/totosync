@@ -34,7 +34,8 @@ register_deactivation_hook( __FILE__, 'totosync_deactivate' );
 
 add_action( 'admin_menu',            'totosync_admin_menu' );
 add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
-add_action( 'wp_ajax_totosync_sync', 'totosync_ajax_handler' );
+add_action( 'wp_ajax_totosync_start_sync', 'totosync_ajax_start_sync' );
+add_action( 'wp_ajax_totosync_poll',       'totosync_ajax_poll' );
 add_action( TOTOSYNC_CRON_HOOK,      'totosync_run_sync' );
 
 // Register a 30-minute cron interval ("twicehourly" if WordPress doesn't ship one).
@@ -93,15 +94,40 @@ function totosync_enqueue_scripts( $hook ) {
         true
     );
     wp_localize_script( 'totosync-admin', 'totosyncAdmin', [
-        'ajaxurl' => admin_url( 'admin-ajax.php' ),
-        'nonce'   => wp_create_nonce( 'totosync_nonce' ),
+        'ajaxurl'   => admin_url( 'admin-ajax.php' ),
+        'nonce'     => wp_create_nonce( 'totosync_nonce' ),
+        'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
+        'running'   => get_transient( 'totosync_running' ) ? true : false,
     ] );
 }
 
 function totosync_page() {
-    $last_sync = get_option( TOTOSYNC_LAST_OPT );
-    $log       = get_option( TOTOSYNC_LOG_OPT, [] );
-    $next_cron = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
+    $last_sync        = get_option( TOTOSYNC_LAST_OPT );
+    $log              = get_option( TOTOSYNC_LOG_OPT, [] );
+    $next_cron        = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
+    $server_cron_mode = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+    $sync_running     = (bool) get_transient( 'totosync_running' );
+
+    // ── Cron health calculation ───────────────────────────────────────────────
+    if ( ! $last_sync ) {
+        $health_dot   = '#aaa';
+        $health_label = 'Never run';
+        $health_ago   = 'No syncs have run yet.';
+    } else {
+        $age = time() - (int) $last_sync;
+        if ( $age < 35 * MINUTE_IN_SECONDS ) {
+            $health_dot   = '#46b450';
+            $health_label = 'Healthy';
+        } elseif ( $age < 90 * MINUTE_IN_SECONDS ) {
+            $health_dot   = '#ffb900';
+            $health_label = 'Running late';
+        } else {
+            $health_dot   = '#dc3232';
+            $health_label = 'Not running';
+        }
+        $health_ago = 'Last run ' . human_time_diff( (int) $last_sync, time() ) . ' ago'
+                    . ' &mdash; ' . esc_html( date_i18n( 'D, d M Y H:i:s', (int) $last_sync ) );
+    }
 
     echo '<div class="wrap">';
     echo '<h1>ToToSync &mdash; WooCommerce Product Sync</h1>';
@@ -111,44 +137,71 @@ function totosync_page() {
        . 'margin-bottom:20px;border-radius:4px;max-width:660px;">';
     echo '<h2 style="margin-top:0">Status</h2>';
 
-    echo '<p><strong>Last sync:</strong> '
-       . ( $last_sync
-           ? esc_html( date_i18n( 'D, d M Y H:i:s', $last_sync ) )
-           : '<em>Never run yet</em>' )
+    // Cron health row
+    echo '<p style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+       . '<span style="display:inline-block;width:14px;height:14px;border-radius:50%;'
+       . 'background:' . $health_dot . ';flex-shrink:0;"></span>'
+       . '<strong>' . esc_html( $health_label ) . '</strong>'
+       . ' &nbsp;<span style="color:#555;font-size:13px;">' . $health_ago . '</span>'
        . '</p>';
 
-    if ( $next_cron ) {
-        echo '<p><strong>Next auto-sync:</strong> '
-           . esc_html( date_i18n( 'D, d M Y H:i:s', $next_cron ) )
-           . ' &nbsp;<span style="color:#888">(runs every 30 min)</span></p>';
-    } else {
-        echo '<p><strong>Next auto-sync:</strong> '
-           . '<span style="color:red">Not scheduled &mdash; deactivate &amp; reactivate the plugin.</span></p>';
+    if ( $sync_running ) {
+        echo '<p style="color:#0073aa;font-size:13px;margin-top:0;">'
+           . '&#9696; Sync is currently running&hellip;</p>';
     }
 
-    echo '<p><strong>API:</strong><br><code>' . esc_html( TOTOSYNC_API_URL ) . '</code></p>';
+    // Cron mode row
+    if ( $server_cron_mode ) {
+        echo '<p style="margin:6px 0;font-size:13px;">'
+           . '<strong>Cron mode:</strong> '
+           . '<span style="color:#46b450;">&#10003; Server cron active</span>'
+           . ' &mdash; <code>DISABLE_WP_CRON</code> is set in <code>wp-config.php</code></p>';
+    } else {
+        echo '<p style="margin:6px 0;font-size:13px;">'
+           . '<strong>Cron mode:</strong> WP-Cron (fires on page visits)';
+        if ( $next_cron ) {
+            echo ' &mdash; next run in ~'
+               . human_time_diff( time(), $next_cron );
+        } else {
+            echo ' &mdash; <span style="color:#dc3232;">not scheduled &mdash; '
+               . 'deactivate &amp; reactivate the plugin</span>';
+        }
+        echo '</p>';
 
-    echo '<p style="color:#777;font-size:12px;margin-bottom:0;">'
-       . 'For 100% reliable background syncs add a real server cron (recommended):<br>'
-       . '<code>*/30 * * * * curl -s ' . esc_url( site_url( '/wp-cron.php?doing_wp_cron' ) )
-       . ' &gt;/dev/null 2&gt;&amp;1</code></p>';
+        // Suggest server cron if not already using it
+        echo '<p style="color:#777;font-size:12px;margin:8px 0 0;padding:8px;'
+           . 'background:#f8f8f8;border-left:3px solid #ffb900;">'
+           . '<strong>Tip:</strong> For reliable background syncs, '
+           . 'add <code>define(\'DISABLE_WP_CRON\', true);</code> to <code>wp-config.php</code> '
+           . 'and add a server cron:<br>'
+           . '<code style="word-break:break-all;">*/30 * * * * php '
+           . esc_html( WP_CONTENT_DIR . '/plugins/totosync/sync.php' )
+           . ' &gt;&gt; /var/log/totosync.log 2&gt;&amp;1</code></p>';
+    }
+
+    echo '<p style="margin:10px 0 0;font-size:13px;">'
+       . '<strong>API endpoint:</strong><br>'
+       . '<code>' . esc_html( TOTOSYNC_API_URL ) . '</code></p>';
 
     echo '</div>';
 
     // ── Manual sync ──────────────────────────────────────────────────────────
     echo '<div style="max-width:660px;">';
     echo '<button id="totosync-btn" class="button button-primary" '
-       . 'style="height:36px;padding:0 20px;font-size:14px;">Sync Now</button>';
+       . 'style="height:36px;padding:0 20px;font-size:14px;"'
+       . ( $sync_running ? ' disabled' : '' ) . '>Sync Now</button>';
     echo '<span id="totosync-spinner" class="spinner" '
-       . 'style="float:none;margin:4px 0 0 8px;vertical-align:middle;visibility:hidden;"></span>';
+       . 'style="float:none;margin:4px 0 0 8px;vertical-align:middle;'
+       . 'visibility:' . ( $sync_running ? 'visible' : 'hidden' ) . ';"></span>';
 
-    echo '<div id="totosync-progress-wrap" style="margin-top:14px;display:none;">';
-    echo '<progress id="totosync-progress" value="0" max="100" '
-       . 'style="width:100%;height:22px;display:block;"></progress>';
-    echo '<p id="totosync-label" style="margin:4px 0 0;color:#555;font-size:12px;"></p>';
+    echo '<div id="totosync-status" style="margin-top:10px;font-size:13px;color:#555;">';
+    if ( $sync_running ) {
+        echo 'Sync is running in the background. This page polls every 5 s &mdash; '
+           . 'you can also <a href="">refresh manually</a>.';
+    }
     echo '</div>';
 
-    echo '<div id="totosync-result" style="margin-top:12px;"></div>';
+    echo '<div id="totosync-result" style="margin-top:8px;"></div>';
     echo '</div>';
 
     // ── Sync log ─────────────────────────────────────────────────────────────
@@ -171,68 +224,89 @@ function totosync_page() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AJAX handler — batched manual sync
+// AJAX handler — fire-and-forget background sync
 // ─────────────────────────────────────────────────────────────────────────────
 
-function totosync_ajax_handler() {
+/**
+ * Kick off a manual sync in the background.
+ *
+ * Sends the JSON response to the browser immediately, then closes the HTTP
+ * connection and continues running totosync_run_sync() server-side.
+ * This means the browser can safely navigate away — the sync will complete
+ * regardless of whether the admin page stays open.
+ */
+function totosync_ajax_start_sync() {
     check_ajax_referer( 'totosync_nonce', 'nonce' );
 
     if ( ! current_user_can( 'manage_options' ) ) {
         wp_send_json_error( 'Unauthorized', 403 );
     }
 
-    $offset     = isset( $_POST['offset'] )     ? absint( $_POST['offset'] )     : 0;
-    $batch_size = isset( $_POST['batch_size'] ) ? absint( $_POST['batch_size'] ) : 10;
-
-    $cache_key = 'totosync_data_' . get_current_user_id();
-
-    if ( $offset === 0 ) {
-        // First batch: fetch fresh data and cache it for subsequent batches.
-        $products = totosync_fetch_products();
-        if ( is_wp_error( $products ) ) {
-            wp_send_json_error( $products->get_error_message() );
-        }
-        set_transient( $cache_key, $products, HOUR_IN_SECONDS );
-    } else {
-        $products = get_transient( $cache_key );
-        if ( $products === false ) {
-            wp_send_json_error( 'Session expired — please start the sync again.' );
-        }
+    // Guard against double-triggers.
+    if ( get_transient( 'totosync_running' ) ) {
+        wp_send_json_success( [
+            'already_running' => true,
+            'last_sync'       => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
+        ] );
+        return;
     }
 
-    $total   = count( $products );
-    $chunk   = array_slice( $products, $offset, $batch_size );
-    $results = [];
+    // Mark sync as in-progress (expires after 10 min as a failsafe).
+    set_transient( 'totosync_running', time(), 10 * MINUTE_IN_SECONDS );
 
-    foreach ( $chunk as $item ) {
-        $results[] = totosync_process_product( $item );
+    $last_sync_before = (int) get_option( TOTOSYNC_LAST_OPT, 0 );
+
+    // Build the response body before we flush output buffers.
+    $body = wp_json_encode( [
+        'success' => true,
+        'data'    => [
+            'started'   => true,
+            'last_sync' => $last_sync_before,
+        ],
+    ] );
+
+    // Flush all output buffers accumulated by WordPress so far.
+    while ( ob_get_level() ) {
+        ob_end_clean();
     }
 
-    $done = ( $offset + $batch_size ) >= $total;
+    // Send headers + response, then close the connection.
+    // The browser receives the JSON and is free to navigate away.
+    header( 'Content-Type: application/json; charset=UTF-8' );
+    header( 'Connection: close' );
+    header( 'Content-Length: ' . strlen( $body ) );
+    echo $body;
+    flush();
 
-    if ( $done ) {
-        // Trash products / variations that have disappeared from the API.
-        $api_skus  = array_values( array_filter( array_map(
-            fn( $item ) => trim( $item['itemCode'] ?? '' ),
-            $products
-        ) ) );
-        $trash_log = totosync_trash_removed( $api_skus );
+    // PHP-FPM: tell the SAPI the response is complete.
+    if ( function_exists( 'fastcgi_finish_request' ) ) {
+        fastcgi_finish_request();
+    }
 
-        delete_transient( $cache_key );
-        update_option( TOTOSYNC_LAST_OPT, time() );
-        $log = array_merge(
-            [ [ 'type' => 'info', 'message' => 'Manual sync completed at ' . date( 'Y-m-d H:i:s' ) . ' — ' . $total . ' products' ] ],
-            $results,
-            $trash_log
-        );
-        update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
+    // Continue running even if the client has disconnected.
+    ignore_user_abort( true );
+    set_time_limit( 300 );
+
+    // Run the full sync — this is the same code the server cron calls.
+    totosync_run_sync();
+    delete_transient( 'totosync_running' );
+    exit;
+}
+
+/**
+ * Lightweight polling endpoint — returns the current sync state.
+ * JS calls this every 5 s to detect when a background sync finishes.
+ */
+function totosync_ajax_poll() {
+    check_ajax_referer( 'totosync_nonce', 'nonce' );
+
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized', 403 );
     }
 
     wp_send_json_success( [
-        'total'   => $total,
-        'offset'  => $offset,
-        'done'    => $done,
-        'results' => $results,
+        'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
+        'running'   => (bool) get_transient( 'totosync_running' ),
     ] );
 }
 
