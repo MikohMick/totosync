@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
- * Version:     2.1.2
+ * Version:     2.1.3
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.1.2' );
+define( 'TOTOSYNC_VERSION',   '2.1.3' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
@@ -65,6 +65,10 @@ function totosync_deactivate() {
     if ( $ts ) {
         wp_unschedule_event( $ts, TOTOSYNC_CRON_HOOK );
     }
+    // Clear runtime transients so a stale lock can't block the next sync
+    // after the plugin is re-enabled.
+    delete_transient( 'totosync_running' );
+    delete_transient( TOTOSYNC_PROG_KEY );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
