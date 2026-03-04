@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
- * Version:     2.1.0
+ * Version:     2.1.1
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.1.0' );
+define( 'TOTOSYNC_VERSION',   '2.1.1' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
@@ -359,6 +359,10 @@ function totosync_ajax_poll() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function totosync_run_sync() {
+    // Ensure the process doesn't get killed by a PHP execution time limit
+    // when running via CLI cron or a long-lived server request.
+    set_time_limit( 0 );
+
     $products = totosync_fetch_products();
     if ( is_wp_error( $products ) ) {
         error_log( '[ToToSync] API fetch failed: ' . $products->get_error_message() );
@@ -924,7 +928,7 @@ function totosync_attach_image( $post_id, $url ) {
     require_once ABSPATH . 'wp-admin/includes/image.php';
     require_once ABSPATH . 'wp-admin/includes/media.php';
 
-    $tmp = download_url( $url );
+    $tmp = download_url( $url, 15 ); // 15-second timeout — skip slow/hung image servers
     if ( is_wp_error( $tmp ) ) {
         error_log( '[ToToSync] download_url failed (' . $url . '): ' . $tmp->get_error_message() );
         return false;
