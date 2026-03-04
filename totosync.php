@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
- * Version:     2.1.1
+ * Version:     2.1.2
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.1.1' );
+define( 'TOTOSYNC_VERSION',   '2.1.2' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
@@ -932,6 +932,16 @@ function totosync_attach_image( $post_id, $url ) {
     if ( is_wp_error( $tmp ) ) {
         error_log( '[ToToSync] download_url failed (' . $url . '): ' . $tmp->get_error_message() );
         return false;
+    }
+
+    // Resize to max 1200×1200 px at 85 % quality before sideloading.
+    // This caps the stored original so WordPress's derived thumbnail sizes
+    // (WooCommerce shop/catalogue/single) are generated from a lean source.
+    $editor = wp_get_image_editor( $tmp );
+    if ( ! is_wp_error( $editor ) ) {
+        $editor->set_quality( 85 );
+        $editor->resize( 1200, 1200, false ); // false = keep aspect ratio, no crop
+        $editor->save( $tmp );                // overwrite temp file in place
     }
 
     $file_array = [
