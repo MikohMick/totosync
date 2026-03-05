@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Manual sync only — no automatic scheduling.
- * Version:     2.2.0
+ * Version:     2.2.1
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.2.0' );
+define( 'TOTOSYNC_VERSION',   '2.2.1' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
@@ -604,24 +604,37 @@ function totosync_get_or_create_variation(
     }
 
     // Fall back: scan existing children for matching colour + measurement.
-    $parent = wc_get_product( $parent_id );
-    if ( $parent && $parent->is_type( 'variable' ) ) {
-        foreach ( $parent->get_children() as $child_id ) {
+    // Use a fresh DB query instead of $parent->get_children() to avoid WC object-cache
+    // returning a stale children list (e.g. a variation created earlier in this sync run).
+    $children = get_posts( [
+        'post_type'      => 'product_variation',
+        'post_parent'    => $parent_id,
+        'post_status'    => [ 'publish', 'private' ],
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+    ] );
+
+    foreach ( $children as $child_id ) {
+        // Compare against the stored slug (what write_variation_attrs saves) rather than
+        // get_attribute() which may return a term label or a cached empty string.
+        $stored_colour      = get_post_meta( $child_id, 'attribute_pa_colour',      true );
+        $stored_measurement = get_post_meta( $child_id, 'attribute_pa_measurement', true );
+
+        if ( sanitize_title( $colour )      === $stored_colour &&
+             sanitize_title( $measurement ) === $stored_measurement ) {
             $child = wc_get_product( $child_id );
             if ( ! $child ) {
                 continue;
             }
-            if ( strtolower( trim( $child->get_attribute( 'pa_colour' ) ) )      === strtolower( $colour ) &&
-                 strtolower( trim( $child->get_attribute( 'pa_measurement' ) ) ) === strtolower( $measurement ) ) {
-                $child->set_regular_price( $price );
-                $child->set_sku( $sku );
-                $child->set_description( $description );
-                $child->set_status( 'publish' ); // Restore if previously trashed.
-                totosync_set_stock( $child, $qty );
-                $child->save();
-                totosync_write_variation_attrs( $child_id, $colour, $measurement );
-                return $child_id;
-            }
+            $child->set_regular_price( $price );
+            $child->set_sku( $sku );
+            $child->set_description( $description );
+            $child->set_status( 'publish' ); // Restore if previously trashed.
+            totosync_set_stock( $child, $qty );
+            $child->save();
+            totosync_write_variation_attrs( $child_id, $colour, $measurement );
+            WC_Product_Variable::sync( $parent_id );
+            return $child_id;
         }
     }
 
@@ -637,6 +650,7 @@ function totosync_get_or_create_variation(
 
     if ( $new_id ) {
         totosync_write_variation_attrs( $new_id, $colour, $measurement );
+        WC_Product_Variable::sync( $parent_id );
     }
 
     return $new_id ?: false;
