@@ -666,48 +666,48 @@ function totosync_ensure_term( $taxonomy, $value ) {
 
 /**
  * Add a term to a parent variable product's attribute definition.
- * Uses the proper WC_Product_Attribute API so WooCommerce shows the
- * correct attribute options on the product page.
+ *
+ * Root cause of previous bug: WooCommerce's $product->save() calls
+ * wp_set_object_terms() WITHOUT $append=true, so each per-variation save
+ * replaced all previously accumulated terms with only the current term.
+ * Because items are processed one at a time, the parent always ended up
+ * with only the last-saved variation's single term per attribute.
+ *
+ * Fix: bypass the WC_Product object layer for term assignment entirely.
+ * Use wp_set_object_terms($append=true) so terms always accumulate, and
+ * manage _product_attributes meta directly for the attribute definition
+ * (is_visible / is_variation flags). WooCommerce reads taxonomy attribute
+ * options from wp_get_object_terms(), not from the meta 'value' field,
+ * so this is the canonical, cache-safe way to register options.
  */
 function totosync_add_term_to_parent( $parent_id, $taxonomy, $attr_id, $term_id ) {
     if ( ! $term_id ) {
         return;
     }
 
-    $product    = wc_get_product( $parent_id );
-    if ( ! $product ) {
-        return;
+    // 1. Append the term to the product's taxonomy relationship.
+    //    $append=true means existing terms are NEVER replaced — only new
+    //    ones are added — so every variation's terms accumulate correctly.
+    wp_set_object_terms( $parent_id, [ $term_id ], $taxonomy, /* append */ true );
+
+    // 2. Ensure the attribute definition row exists in _product_attributes.
+    //    For taxonomy attributes WooCommerce ignores the 'value' field and
+    //    reads options via wp_get_object_terms(), so 'value' stays empty.
+    $raw = get_post_meta( $parent_id, '_product_attributes', true );
+    if ( ! is_array( $raw ) ) {
+        $raw = [];
     }
 
-    $attributes = $product->get_attributes();
-    $changed    = false;
-
-    if ( isset( $attributes[ $taxonomy ] ) ) {
-        $attr    = $attributes[ $taxonomy ];
-        $options = $attr->get_options();
-        if ( ! in_array( $term_id, $options, true ) ) {
-            $options[] = $term_id;
-            $attr->set_options( $options );
-            $attributes[ $taxonomy ] = $attr;
-            $changed = true;
-        }
-    } else {
-        $attr = new WC_Product_Attribute();
-        $attr->set_id( $attr_id );
-        $attr->set_name( $taxonomy );
-        $attr->set_options( [ $term_id ] );
-        $attr->set_visible( true );
-        $attr->set_variation( true );
-        $attributes[ $taxonomy ] = $attr;
-        $changed = true;
-    }
-
-    if ( $changed ) {
-        $product->set_attributes( $attributes );
-        $product->save();
-        // Bust WP's object cache and WC's product transients so the next
-        // wc_get_product() call for this parent (e.g. in a subsequent variation
-        // loop iteration) reloads fresh attribute data from the database.
+    if ( ! isset( $raw[ $taxonomy ] ) ) {
+        $raw[ $taxonomy ] = [
+            'name'         => $taxonomy,
+            'value'        => '',
+            'position'     => count( $raw ),
+            'is_visible'   => 1,
+            'is_variation' => 1,
+            'is_taxonomy'  => 1,
+        ];
+        update_post_meta( $parent_id, '_product_attributes', $raw );
         wc_delete_product_transients( $parent_id );
         clean_post_cache( $parent_id );
     }
