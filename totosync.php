@@ -4,8 +4,8 @@
  * Plugin URI:  https://github.com/MikohMick/totosync
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
- *              Runs automatically every 30 minutes via WP-Cron; also supports manual sync.
- * Version:     2.1.0
+ *              Manual sync only — no automatic scheduling.
+ * Version:     2.3.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,13 +18,25 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.1.0' );
+define( 'TOTOSYNC_VERSION',   '2.3.0' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
-define( 'TOTOSYNC_CRON_HOOK', 'totosync_scheduled_sync' );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
 define( 'TOTOSYNC_LAST_OPT',  'totosync_last_sync' );
 define( 'TOTOSYNC_PROG_KEY',  'totosync_progress' );
+
+// ── Test mode ──────────────────────────────────────────────────────────────────
+// Set to a positive integer to process only that many API items across a curated
+// mix of scenarios (multi-variation, single-variation, with/without attributes).
+// Set to 0 (or remove) to process the full catalogue.
+define( 'TOTOSYNC_TEST_LIMIT', 0 );
+
+// ── Product name filter (for targeted testing) ─────────────────────────────────
+// Set to a non-empty string to process ONLY items whose itemName exactly matches
+// this value. The full API is still fetched; only the matching product is synced.
+// Trash step is skipped so other products are not affected.
+// Set to '' (empty string) to process all products normally.
+define( 'TOTOSYNC_TEST_PRODUCT', 'Baby T-shirt Set Of 5' );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
@@ -37,34 +49,22 @@ add_action( 'admin_menu',            'totosync_admin_menu' );
 add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
 add_action( 'wp_ajax_totosync_start_sync', 'totosync_ajax_start_sync' );
 add_action( 'wp_ajax_totosync_poll',       'totosync_ajax_poll' );
-add_action( TOTOSYNC_CRON_HOOK,      'totosync_run_sync' );
-
-// Register a 30-minute cron interval ("twicehourly" if WordPress doesn't ship one).
-add_filter( 'cron_schedules', function ( $schedules ) {
-    if ( ! isset( $schedules['twicehourly'] ) ) {
-        $schedules['twicehourly'] = [
-            'interval' => 30 * MINUTE_IN_SECONDS,
-            'display'  => 'Twice Per Hour (every 30 min)',
-        ];
-    }
-    return $schedules;
-} );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation / Deactivation
 // ─────────────────────────────────────────────────────────────────────────────
 
 function totosync_activate() {
-    if ( ! wp_next_scheduled( TOTOSYNC_CRON_HOOK ) ) {
-        wp_schedule_event( time(), 'twicehourly', TOTOSYNC_CRON_HOOK );
+    // Generate a listener secret used to authenticate sync-listener.php calls.
+    if ( ! get_option( 'totosync_listener_secret' ) ) {
+        update_option( 'totosync_listener_secret', wp_generate_password( 32, false ), false );
     }
 }
 
 function totosync_deactivate() {
-    $ts = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
-    if ( $ts ) {
-        wp_unschedule_event( $ts, TOTOSYNC_CRON_HOOK );
-    }
+    // Clear runtime transients so a stale lock can't block the next manual sync.
+    delete_transient( 'totosync_running' );
+    delete_transient( TOTOSYNC_PROG_KEY );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,32 +105,9 @@ function totosync_enqueue_scripts( $hook ) {
 }
 
 function totosync_page() {
-    $last_sync        = get_option( TOTOSYNC_LAST_OPT );
-    $log              = get_option( TOTOSYNC_LOG_OPT, [] );
-    $next_cron        = wp_next_scheduled( TOTOSYNC_CRON_HOOK );
-    $server_cron_mode = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
-    $sync_running     = (bool) get_transient( 'totosync_running' );
-
-    // ── Cron health calculation ───────────────────────────────────────────────
-    if ( ! $last_sync ) {
-        $health_dot   = '#aaa';
-        $health_label = 'Never run';
-        $health_ago   = 'No syncs have run yet.';
-    } else {
-        $age = time() - (int) $last_sync;
-        if ( $age < 35 * MINUTE_IN_SECONDS ) {
-            $health_dot   = '#46b450';
-            $health_label = 'Healthy';
-        } elseif ( $age < 90 * MINUTE_IN_SECONDS ) {
-            $health_dot   = '#ffb900';
-            $health_label = 'Running late';
-        } else {
-            $health_dot   = '#dc3232';
-            $health_label = 'Not running';
-        }
-        $health_ago = 'Last run ' . human_time_diff( (int) $last_sync, time() ) . ' ago'
-                    . ' &mdash; ' . esc_html( date_i18n( 'D, d M Y H:i:s', (int) $last_sync ) );
-    }
+    $last_sync    = get_option( TOTOSYNC_LAST_OPT );
+    $log          = get_option( TOTOSYNC_LOG_OPT, [] );
+    $sync_running = (bool) get_transient( 'totosync_running' );
 
     echo '<div class="wrap">';
     echo '<h1>ToToSync &mdash; WooCommerce Product Sync</h1>';
@@ -140,66 +117,18 @@ function totosync_page() {
        . 'margin-bottom:20px;border-radius:4px;max-width:660px;">';
     echo '<h2 style="margin-top:0">Status</h2>';
 
-    // Cron health row
-    echo '<p style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-       . '<span style="display:inline-block;width:14px;height:14px;border-radius:50%;'
-       . 'background:' . $health_dot . ';flex-shrink:0;"></span>'
-       . '<strong>' . esc_html( $health_label ) . '</strong>'
-       . ' &nbsp;<span style="color:#555;font-size:13px;">' . $health_ago . '</span>'
-       . '</p>';
-
-    if ( $sync_running ) {
-        echo '<p style="color:#0073aa;font-size:13px;margin-top:0;">'
-           . '&#9696; Sync is currently running&hellip;</p>';
+    if ( $last_sync ) {
+        echo '<p style="margin:0 0 6px;font-size:13px;">'
+           . '<strong>Last sync:</strong> '
+           . esc_html( date_i18n( 'D, d M Y H:i:s', (int) $last_sync ) )
+           . ' (' . human_time_diff( (int) $last_sync, time() ) . ' ago)</p>';
+    } else {
+        echo '<p style="margin:0 0 6px;font-size:13px;color:#888;">No syncs have run yet.</p>';
     }
 
-    // Cron mode row
-    $sync_php_path = __DIR__ . '/sync.php';
-    $php_bin       = defined( 'PHP_BINARY' ) && PHP_BINARY ? PHP_BINARY : 'php';
-    $cron_cmd      = '*/30 * * * * ' . $php_bin . ' ' . $sync_php_path
-                   . ' >> /var/log/totosync.log 2>&1';
-
-    if ( $server_cron_mode ) {
-        echo '<p style="margin:6px 0;font-size:13px;">'
-           . '<strong>Cron mode:</strong> '
-           . '<span style="color:#46b450;">&#10003; Server cron active</span>'
-           . ' (<code>DISABLE_WP_CRON</code> is set in <code>wp-config.php</code>)</p>';
-
-        echo '<div style="font-size:12px;margin:8px 0 0;padding:10px 12px;'
-           . 'background:#f8f8f8;border:1px solid #ddd;border-radius:3px;">';
-        echo '<p style="margin:0 0 6px;"><strong>The green/grey dot above is how you know if cron is working.</strong> '
-           . 'WordPress cannot directly detect an OS cron job &mdash; but if the dot turns green '
-           . 'within 35 minutes of setup, your cron is firing correctly.</p>';
-        echo '<p style="margin:0 0 4px;"><strong>To verify your crontab is set, run in terminal:</strong></p>';
-        echo '<code style="display:block;word-break:break-all;padding:6px 8px;'
-           . 'background:#fff;border:1px solid #ddd;margin-bottom:8px;">'
-           . 'crontab -l</code>';
-        echo '<p style="margin:0 0 4px;"><strong>You should see this line (or similar):</strong></p>';
-        echo '<code style="display:block;word-break:break-all;padding:6px 8px;'
-           . 'background:#fff;border:1px solid #ddd;">'
-           . esc_html( $cron_cmd ) . '</code>';
-        echo '</div>';
-    } else {
-        echo '<p style="margin:6px 0;font-size:13px;">'
-           . '<strong>Cron mode:</strong> WP-Cron (fires on page visits)';
-        if ( $next_cron ) {
-            echo ' &mdash; next run in ~' . human_time_diff( time(), $next_cron );
-        } else {
-            echo ' &mdash; <span style="color:#dc3232;">not scheduled &mdash; '
-               . 'deactivate &amp; reactivate the plugin</span>';
-        }
-        echo '</p>';
-
-        echo '<div style="font-size:12px;margin:8px 0 0;padding:10px 12px;'
-           . 'background:#fffbf0;border-left:3px solid #ffb900;">';
-        echo '<p style="margin:0 0 6px;"><strong>Recommended:</strong> Switch to a real server cron for reliable 30-minute syncs.</p>';
-        echo '<p style="margin:0 0 4px;">1. Add to <code>wp-config.php</code> (above the "stop editing" line):</p>';
-        echo '<code style="display:block;padding:6px 8px;background:#fff;border:1px solid #ddd;margin-bottom:8px;">'
-           . "define( 'DISABLE_WP_CRON', true );</code>";
-        echo '<p style="margin:0 0 4px;">2. Run <code>crontab -e</code> and add:</p>';
-        echo '<code style="display:block;word-break:break-all;padding:6px 8px;background:#fff;border:1px solid #ddd;">'
-           . esc_html( $cron_cmd ) . '</code>';
-        echo '</div>';
+    if ( $sync_running ) {
+        echo '<p style="color:#0073aa;font-size:13px;margin:0;">'
+           . '&#9696; Sync is currently running&hellip;</p>';
     }
 
     echo '<p style="margin:10px 0 0;font-size:13px;">'
@@ -272,10 +201,9 @@ function totosync_page() {
 /**
  * Kick off a manual sync in the background.
  *
- * Sends the JSON response to the browser immediately, then closes the HTTP
- * connection and continues running totosync_run_sync() server-side.
- * This means the browser can safely navigate away — the sync will complete
- * regardless of whether the admin page stays open.
+ * Makes a non-blocking HTTP POST to sync-listener.php and immediately
+ * returns JSON to the browser. The listener handles the actual sync,
+ * so the button always responds instantly regardless of server config.
  */
 function totosync_ajax_start_sync() {
     check_ajax_referer( 'totosync_nonce', 'nonce' );
@@ -293,46 +221,24 @@ function totosync_ajax_start_sync() {
         return;
     }
 
-    // Mark sync as in-progress (expires after 10 min as a failsafe).
-    set_transient( 'totosync_running', time(), 10 * MINUTE_IN_SECONDS );
+    // Fire-and-forget: POST to sync-listener.php with timeout=0.01 so
+    // wp_remote_post returns before the listener responds.
+    $secret = get_option( 'totosync_listener_secret', '' );
+    wp_remote_post(
+        plugins_url( 'sync-listener.php', __FILE__ ),
+        [
+            'timeout'   => 0.01,
+            'blocking'  => false,
+            'sslverify' => false,
+            'cookies'   => [],
+            'body'      => [ 'totosync_secret' => $secret ],
+        ]
+    );
 
-    $last_sync_before = (int) get_option( TOTOSYNC_LAST_OPT, 0 );
-
-    // Build the response body before we flush output buffers.
-    $body = wp_json_encode( [
-        'success' => true,
-        'data'    => [
-            'started'   => true,
-            'last_sync' => $last_sync_before,
-        ],
+    wp_send_json_success( [
+        'started'   => true,
+        'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
     ] );
-
-    // Flush all output buffers accumulated by WordPress so far.
-    while ( ob_get_level() ) {
-        ob_end_clean();
-    }
-
-    // Send headers + response, then close the connection.
-    // The browser receives the JSON and is free to navigate away.
-    header( 'Content-Type: application/json; charset=UTF-8' );
-    header( 'Connection: close' );
-    header( 'Content-Length: ' . strlen( $body ) );
-    echo $body;
-    flush();
-
-    // PHP-FPM: tell the SAPI the response is complete.
-    if ( function_exists( 'fastcgi_finish_request' ) ) {
-        fastcgi_finish_request();
-    }
-
-    // Continue running even if the client has disconnected.
-    ignore_user_abort( true );
-    set_time_limit( 300 );
-
-    // Run the full sync — this is the same code the server cron calls.
-    totosync_run_sync();
-    delete_transient( 'totosync_running' );
-    exit;
 }
 
 /**
@@ -355,40 +261,166 @@ function totosync_ajax_poll() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cron — automatic sync every 30 minutes
+// Sync runner
 // ─────────────────────────────────────────────────────────────────────────────
 
 function totosync_run_sync() {
+    set_time_limit( 0 );
+
     $products = totosync_fetch_products();
     if ( is_wp_error( $products ) ) {
         error_log( '[ToToSync] API fetch failed: ' . $products->get_error_message() );
         return;
     }
 
-    $total = count( $products );
-    $log   = [ [
+    // Group items by itemName — the name identifies the parent product;
+    // each item in the group becomes a variation regardless of attribute count.
+    $groups = [];
+    foreach ( $products as $item ) {
+        $name = trim( $item['itemName'] ?? '' );
+        if ( $name !== '' ) {
+            $groups[ $name ][] = $item;
+        }
+    }
+
+    // ── Product name filter ───────────────────────────────────────────────────
+    // When TOTOSYNC_TEST_PRODUCT is set, keep only the matching group so we can
+    // test a single product's full variation set without touching the rest.
+    $filter_name = defined( 'TOTOSYNC_TEST_PRODUCT' ) ? trim( TOTOSYNC_TEST_PRODUCT ) : '';
+    if ( $filter_name !== '' ) {
+        $groups = isset( $groups[ $filter_name ] ) ? [ $filter_name => $groups[ $filter_name ] ] : [];
+    }
+
+    // ── Test mode ────────────────────────────────────────────────────────────
+    // When TOTOSYNC_TEST_LIMIT > 0, select a curated mix of up to that many
+    // items covering all sync scenarios, then skip the trash step so we don't
+    // accidentally trash products not included in the test run.
+    $test_mode = ( $filter_name !== '' ) || ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 );
+    if ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 ) {
+        $groups = totosync_select_test_groups( $groups, TOTOSYNC_TEST_LIMIT );
+    }
+
+    // Flatten groups back to a flat list so we can count and track progress.
+    $items_to_process = [];
+    foreach ( $groups as $items ) {
+        foreach ( $items as $item ) {
+            $items_to_process[] = $item;
+        }
+    }
+
+    $total = count( $items_to_process );
+    $mode_label = '';
+    if ( $filter_name !== '' ) {
+        $mode_label = '[FILTER: "' . $filter_name . '"] ';
+    } elseif ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 ) {
+        $mode_label = '[TEST MODE – ' . TOTOSYNC_TEST_LIMIT . ' items] ';
+    }
+    $log = [ [
         'type'    => 'info',
-        'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' products)',
+        'message' => $mode_label . 'Sync started at ' . date( 'Y-m-d H:i:s' )
+                   . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
     ] ];
 
     set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
 
-    foreach ( $products as $i => $item ) {
+    $processed = 0;
+    foreach ( $items_to_process as $item ) {
         $log[] = totosync_process_product( $item );
-        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $i + 1, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+        $processed++;
+        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
     }
 
-    // Trash products / variations that have disappeared from the API.
-    $api_skus = array_values( array_filter( array_map(
-        fn( $item ) => trim( $item['itemCode'] ?? '' ),
-        $products
-    ) ) );
-    $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
+    // Trash removed products — skipped in test mode since we intentionally
+    // only processed a subset of the catalogue; trashing would remove everything else.
+    if ( ! $test_mode ) {
+        $api_skus = array_values( array_filter( array_map(
+            fn( $item ) => trim( $item['itemCode'] ?? '' ),
+            $products
+        ) ) );
+        $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
+    } else {
+        $log[] = [
+            'type'    => 'info',
+            'message' => 'Trash step skipped in test mode.',
+        ];
+    }
 
     delete_transient( TOTOSYNC_PROG_KEY );
     update_option( TOTOSYNC_LAST_OPT, time() );
     update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
-    error_log( '[ToToSync] Auto-sync done. ' . $total . ' products processed.' );
+    error_log( '[ToToSync] Sync done. ' . $total . ' items processed.' );
+}
+
+/**
+ * From all groups, select up to $limit items covering every sync scenario:
+ *
+ *  Scenario A — Variable with attributes + multiple variations + in stock:
+ *               Groups that have >1 item AND at least one item with colour or measurement AND qty > 0.
+ *  Scenario B — Variable with attributes + one variation (in or out of stock):
+ *               Groups that have exactly 1 item with colour or measurement.
+ *  Scenario C — No attributes (colour and measurement both empty):
+ *               Any group where all items lack colour and measurement.
+ *
+ * Groups are drawn from each bucket in round-robin order until $limit is reached.
+ *
+ * @param  array $groups  All groups keyed by product name.
+ * @param  int   $limit   Maximum total items to return.
+ * @return array          Trimmed groups array.
+ */
+function totosync_select_test_groups( array $groups, int $limit ): array {
+    $bucket_a = []; // multi-variation, has attributes, in-stock
+    $bucket_b = []; // single-variation, has attributes
+    $bucket_c = []; // no attributes at all
+
+    foreach ( $groups as $name => $items ) {
+        $has_attrs   = false;
+        $has_instock = false;
+        foreach ( $items as $item ) {
+            if ( trim( $item['colour'] ?? '' ) !== '' || trim( $item['measurement'] ?? '' ) !== '' ) {
+                $has_attrs = true;
+            }
+            if ( (int) ( $item['quantity'] ?? 0 ) > 0 ) {
+                $has_instock = true;
+            }
+        }
+
+        if ( ! $has_attrs ) {
+            $bucket_c[ $name ] = $items;
+        } elseif ( count( $items ) > 1 && $has_instock ) {
+            $bucket_a[ $name ] = $items;
+        } else {
+            $bucket_b[ $name ] = $items;
+        }
+    }
+
+    // Round-robin pull from buckets until the limit is reached.
+    $selected  = [];
+    $remaining = $limit;
+    $buckets   = array_filter( [ $bucket_a, $bucket_b, $bucket_c ] );
+
+    while ( $remaining > 0 && ! empty( $buckets ) ) {
+        foreach ( $buckets as $key => $bucket ) {
+            if ( $remaining <= 0 ) {
+                break;
+            }
+            // Pick the first group from this bucket.
+            reset( $bucket );
+            $gname = key( $bucket );
+            $items = $bucket[ $gname ];
+
+            // Clip the group's items if they alone exceed the remaining budget.
+            $items                  = array_slice( $items, 0, $remaining );
+            $selected[ $gname ]     = $items;
+            $remaining             -= count( $items );
+            unset( $buckets[ $key ][ $gname ] );
+
+            if ( empty( $buckets[ $key ] ) ) {
+                unset( $buckets[ $key ] );
+            }
+        }
+    }
+
+    return $selected;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -452,16 +484,12 @@ function totosync_process_product( array $item ) {
     }
 
     try {
-        if ( $colour !== '' && $measurement !== '' ) {
-            return totosync_sync_variable(
-                $name, $sku, $colour, $measurement,
-                $price, $qty, $category, $description, $images
-            );
-        } else {
-            return totosync_sync_simple(
-                $name, $sku, $price, $qty, $category, $description, $images
-            );
-        }
+        // All products are variable — the name groups items into a parent;
+        // each API item becomes one variation under that parent.
+        return totosync_sync_variable(
+            $name, $sku, $colour, $measurement,
+            $price, $qty, $category, $description, $images
+        );
     } catch ( Throwable $e ) {
         error_log( '[ToToSync] Exception for SKU ' . $sku . ': ' . $e->getMessage() );
         return [ 'type' => 'error', 'message' => "SKU {$sku}: " . $e->getMessage() ];
@@ -482,24 +510,30 @@ function totosync_sync_variable(
         return [ 'type' => 'error', 'message' => "Could not create parent product for '{$name}'" ];
     }
 
-    // 2. Ensure global WooCommerce attribute taxonomies exist.
-    $colour_attr_id      = totosync_ensure_wc_attribute( 'colour',      'Colour' );
-    $measurement_attr_id = totosync_ensure_wc_attribute( 'measurement', 'Measurement' );
+    // 2. Ensure WC attribute taxonomies + terms — only for non-empty values.
+    $colour_attr_id      = 0;
+    $colour_term_id      = 0;
+    $measurement_attr_id = 0;
+    $measurement_term_id = 0;
 
-    // 3. Get or create the taxonomy terms for this specific colour/measurement.
-    $colour_term_id      = totosync_ensure_term( 'pa_colour',      $colour );
-    $measurement_term_id = totosync_ensure_term( 'pa_measurement', $measurement );
+    if ( $colour !== '' ) {
+        $colour_attr_id = totosync_ensure_wc_attribute( 'colour', 'Colour' );
+        $colour_term_id = totosync_ensure_term( 'pa_colour', $colour );
+        totosync_add_term_to_parent( $parent_id, 'pa_colour', $colour_attr_id, $colour_term_id );
+    }
 
-    // 4. Register both attribute + term with the parent product object.
-    totosync_add_term_to_parent( $parent_id, 'pa_colour',      $colour_attr_id,      $colour_term_id );
-    totosync_add_term_to_parent( $parent_id, 'pa_measurement', $measurement_attr_id, $measurement_term_id );
+    if ( $measurement !== '' ) {
+        $measurement_attr_id = totosync_ensure_wc_attribute( 'measurement', 'Measurement' );
+        $measurement_term_id = totosync_ensure_term( 'pa_measurement', $measurement );
+        totosync_add_term_to_parent( $parent_id, 'pa_measurement', $measurement_attr_id, $measurement_term_id );
+    }
 
-    // 5. Parent image (only if not already set).
+    // 3. Parent image (only if not already set).
     if ( ! has_post_thumbnail( $parent_id ) && ! empty( $images ) ) {
         totosync_attach_image( $parent_id, $images[0] );
     }
 
-    // 6. Create or update the variation.
+    // 4. Create or update the variation.
     $variation_id = totosync_get_or_create_variation(
         $parent_id,
         $colour,      $colour_term_id,
@@ -511,7 +545,7 @@ function totosync_sync_variable(
         return [ 'type' => 'error', 'message' => "Could not create variation for SKU {$sku}" ];
     }
 
-    // 7. Variation image (only if not already set).
+    // 5. Variation image (only if not already set).
     if ( ! has_post_thumbnail( $variation_id ) && ! empty( $images ) ) {
         totosync_attach_image( $variation_id, $images[0] );
     }
@@ -519,10 +553,11 @@ function totosync_sync_variable(
     // Bust the parent's cached price range so WooCommerce recalculates it.
     wc_delete_product_transients( $parent_id );
 
-    $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
+    $attr_parts = array_filter( [ $colour, $measurement ] );
+    $stock_msg  = $qty > 0 ? "qty={$qty}" : 'out of stock';
     return [
         'type'    => 'success',
-        'message' => "Synced variation SKU {$sku} ({$colour} / {$measurement}, {$stock_msg}) under '{$name}'",
+        'message' => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
     ];
 }
 
@@ -543,9 +578,15 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
     $cat_id = totosync_get_or_create_category( $category );
 
     if ( ! empty( $found ) ) {
-        // Update category; restore from trash if it was removed previously.
         $product = wc_get_product( $found[0] );
         if ( $product ) {
+            // If a previous sync created this as a simple product (e.g. when
+            // colour/measurement were absent), convert it to variable in place.
+            if ( ! $product->is_type( 'variable' ) ) {
+                wp_set_object_terms( $found[0], 'variable', 'product_type' );
+                $product = new WC_Product_Variable( $found[0] );
+            }
+            // Update category; restore from trash if it was removed previously.
             $product->set_category_ids( [ $cat_id ] );
             $product->set_status( 'publish' );
             $product->save();
@@ -664,6 +705,11 @@ function totosync_add_term_to_parent( $parent_id, $taxonomy, $attr_id, $term_id 
     if ( $changed ) {
         $product->set_attributes( $attributes );
         $product->save();
+        // Bust WP's object cache and WC's product transients so the next
+        // wc_get_product() call for this parent (e.g. in a subsequent variation
+        // loop iteration) reloads fresh attribute data from the database.
+        wc_delete_product_transients( $parent_id );
+        clean_post_cache( $parent_id );
     }
 }
 
@@ -695,24 +741,37 @@ function totosync_get_or_create_variation(
     }
 
     // Fall back: scan existing children for matching colour + measurement.
-    $parent = wc_get_product( $parent_id );
-    if ( $parent && $parent->is_type( 'variable' ) ) {
-        foreach ( $parent->get_children() as $child_id ) {
+    // Use a fresh DB query instead of $parent->get_children() to avoid WC object-cache
+    // returning a stale children list (e.g. a variation created earlier in this sync run).
+    $children = get_posts( [
+        'post_type'      => 'product_variation',
+        'post_parent'    => $parent_id,
+        'post_status'    => [ 'publish', 'private' ],
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+    ] );
+
+    foreach ( $children as $child_id ) {
+        // Compare against the stored slug (what write_variation_attrs saves) rather than
+        // get_attribute() which may return a term label or a cached empty string.
+        $stored_colour      = get_post_meta( $child_id, 'attribute_pa_colour',      true );
+        $stored_measurement = get_post_meta( $child_id, 'attribute_pa_measurement', true );
+
+        if ( sanitize_title( $colour )      === $stored_colour &&
+             sanitize_title( $measurement ) === $stored_measurement ) {
             $child = wc_get_product( $child_id );
             if ( ! $child ) {
                 continue;
             }
-            if ( strtolower( trim( $child->get_attribute( 'pa_colour' ) ) )      === strtolower( $colour ) &&
-                 strtolower( trim( $child->get_attribute( 'pa_measurement' ) ) ) === strtolower( $measurement ) ) {
-                $child->set_regular_price( $price );
-                $child->set_sku( $sku );
-                $child->set_description( $description );
-                $child->set_status( 'publish' ); // Restore if previously trashed.
-                totosync_set_stock( $child, $qty );
-                $child->save();
-                totosync_write_variation_attrs( $child_id, $colour, $measurement );
-                return $child_id;
-            }
+            $child->set_regular_price( $price );
+            $child->set_sku( $sku );
+            $child->set_description( $description );
+            $child->set_status( 'publish' ); // Restore if previously trashed.
+            totosync_set_stock( $child, $qty );
+            $child->save();
+            totosync_write_variation_attrs( $child_id, $colour, $measurement );
+            WC_Product_Variable::sync( $parent_id );
+            return $child_id;
         }
     }
 
@@ -722,11 +781,13 @@ function totosync_get_or_create_variation(
     $variation->set_sku( $sku );
     $variation->set_regular_price( $price );
     $variation->set_description( $description );
+    $variation->set_status( 'publish' );
     totosync_set_stock( $variation, $qty );
     $new_id = $variation->save();
 
     if ( $new_id ) {
         totosync_write_variation_attrs( $new_id, $colour, $measurement );
+        WC_Product_Variable::sync( $parent_id );
     }
 
     return $new_id ?: false;
@@ -749,73 +810,14 @@ function totosync_set_stock( WC_Product $product, $qty ) {
  * display and match variation attributes on the product page.
  */
 function totosync_write_variation_attrs( $variation_id, $colour, $measurement ) {
-    update_post_meta( $variation_id, 'attribute_pa_colour',      sanitize_title( $colour ) );
-    update_post_meta( $variation_id, 'attribute_pa_measurement', sanitize_title( $measurement ) );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Simple product sync
-// ─────────────────────────────────────────────────────────────────────────────
-
-function totosync_sync_simple( $name, $sku, $price, $qty, $category, $description, $images ) {
-    $cat_id     = totosync_get_or_create_category( $category );
-    $product_id = $sku ? wc_get_product_id_by_sku( $sku ) : 0;
-
-    if ( ! $product_id ) {
-        // Fallback: look up by our custom meta.
-        $found = get_posts( [
-            'post_type'      => 'product',
-            'post_status'    => 'any',
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-            'meta_query'     => [ [ 'key' => '_totosync_item_name', 'value' => $name ] ],
-        ] );
-        if ( ! empty( $found ) ) {
-            $product_id = (int) $found[0];
-        }
+    // Only write postmeta for attributes that are actually set — an empty string
+    // tells WooCommerce to match "any" value, making variations indistinguishable.
+    if ( $colour !== '' ) {
+        update_post_meta( $variation_id, 'attribute_pa_colour', sanitize_title( $colour ) );
     }
-
-    if ( $product_id ) {
-        $product = wc_get_product( $product_id );
-        if ( $product ) {
-            $product->set_name( $name );
-            $product->set_sku( $sku );
-            $product->set_regular_price( $price );
-            $product->set_description( $description );
-            $product->set_category_ids( [ $cat_id ] );
-            $product->set_status( 'publish' ); // Restore if previously trashed.
-            totosync_set_stock( $product, $qty );
-            $product->save();
-
-            if ( ! has_post_thumbnail( $product_id ) && ! empty( $images ) ) {
-                totosync_attach_image( $product_id, $images[0] );
-            }
-
-            $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
-            return [ 'type' => 'success', 'message' => "Updated simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
-        }
+    if ( $measurement !== '' ) {
+        update_post_meta( $variation_id, 'attribute_pa_measurement', sanitize_title( $measurement ) );
     }
-
-    // Create new simple product.
-    $product = new WC_Product_Simple();
-    $product->set_name( $name );
-    $product->set_sku( $sku );
-    $product->set_regular_price( $price );
-    $product->set_description( $description );
-    $product->set_category_ids( [ $cat_id ] );
-    $product->set_status( 'publish' );
-    totosync_set_stock( $product, $qty );
-    $new_id = $product->save();
-
-    if ( $new_id ) {
-        update_post_meta( $new_id, '_totosync_item_name', $name );
-        if ( ! empty( $images ) ) {
-            totosync_attach_image( $new_id, $images[0] );
-        }
-    }
-
-    $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
-    return [ 'type' => 'success', 'message' => "Created simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -924,10 +926,20 @@ function totosync_attach_image( $post_id, $url ) {
     require_once ABSPATH . 'wp-admin/includes/image.php';
     require_once ABSPATH . 'wp-admin/includes/media.php';
 
-    $tmp = download_url( $url );
+    $tmp = download_url( $url, 15 ); // 15-second timeout — skip slow/hung image servers
     if ( is_wp_error( $tmp ) ) {
         error_log( '[ToToSync] download_url failed (' . $url . '): ' . $tmp->get_error_message() );
         return false;
+    }
+
+    // Resize to max 1200×1200 px at 85 % quality before sideloading.
+    // This caps the stored original so WordPress's derived thumbnail sizes
+    // (WooCommerce shop/catalogue/single) are generated from a lean source.
+    $editor = wp_get_image_editor( $tmp );
+    if ( ! is_wp_error( $editor ) ) {
+        $editor->set_quality( 85 );
+        $editor->resize( 1200, 1200, false ); // false = keep aspect ratio, no crop
+        $editor->save( $tmp );                // overwrite temp file in place
     }
 
     $file_array = [
@@ -992,19 +1004,6 @@ function totosync_trash_removed( array $api_skus ) {
     foreach ( $managed_ids as $pid ) {
         $product = wc_get_product( $pid );
         if ( ! $product ) {
-            continue;
-        }
-
-        // ── Simple product ────────────────────────────────────────────────────
-        if ( $product->is_type( 'simple' ) ) {
-            $sku = $product->get_sku();
-            if ( $sku !== '' && ! isset( $api_set[ $sku ] ) ) {
-                wp_trash_post( $pid );
-                $log[] = [
-                    'type'    => 'info',
-                    'message' => "Trashed simple product SKU {$sku} '{$product->get_name()}' (removed from API)",
-                ];
-            }
             continue;
         }
 
