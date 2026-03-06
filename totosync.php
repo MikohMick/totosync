@@ -25,6 +25,12 @@ define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
 define( 'TOTOSYNC_LAST_OPT',  'totosync_last_sync' );
 define( 'TOTOSYNC_PROG_KEY',  'totosync_progress' );
 
+// ── Test mode ──────────────────────────────────────────────────────────────────
+// Set to a positive integer to process only that many API items across a curated
+// mix of scenarios (multi-variation, single-variation, with/without attributes).
+// Set to 0 (or remove) to process the full catalogue.
+define( 'TOTOSYNC_TEST_LIMIT', 10 );
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,12 +266,6 @@ function totosync_run_sync() {
         return;
     }
 
-    $total = count( $products );
-    $log   = [ [
-        'type'    => 'info',
-        'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' products)',
-    ] ];
-
     // Group items by itemName — the name identifies the parent product;
     // each item in the group becomes a variation regardless of attribute count.
     $groups = [];
@@ -276,28 +276,130 @@ function totosync_run_sync() {
         }
     }
 
-    set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+    // ── Test mode ────────────────────────────────────────────────────────────
+    // When TOTOSYNC_TEST_LIMIT > 0, select a curated mix of up to that many
+    // items covering all sync scenarios, then skip the trash step so we don't
+    // accidentally trash products not included in the test run.
+    $test_mode = defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0;
+    if ( $test_mode ) {
+        $groups = totosync_select_test_groups( $groups, TOTOSYNC_TEST_LIMIT );
+    }
 
-    $processed = 0;
+    // Flatten groups back to a flat list so we can count and track progress.
+    $items_to_process = [];
     foreach ( $groups as $items ) {
         foreach ( $items as $item ) {
-            $log[] = totosync_process_product( $item );
-            $processed++;
-            set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+            $items_to_process[] = $item;
         }
     }
 
-    // Trash products / variations that have disappeared from the API.
-    $api_skus = array_values( array_filter( array_map(
-        fn( $item ) => trim( $item['itemCode'] ?? '' ),
-        $products
-    ) ) );
-    $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
+    $total = count( $items_to_process );
+    $log   = [ [
+        'type'    => 'info',
+        'message' => ( $test_mode ? '[TEST MODE – ' . TOTOSYNC_TEST_LIMIT . ' items] ' : '' )
+                   . 'Sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
+    ] ];
+
+    set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+
+    $processed = 0;
+    foreach ( $items_to_process as $item ) {
+        $log[] = totosync_process_product( $item );
+        $processed++;
+        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+    }
+
+    // Trash removed products — skipped in test mode since we intentionally
+    // only processed a subset of the catalogue; trashing would remove everything else.
+    if ( ! $test_mode ) {
+        $api_skus = array_values( array_filter( array_map(
+            fn( $item ) => trim( $item['itemCode'] ?? '' ),
+            $products
+        ) ) );
+        $log = array_merge( $log, totosync_trash_removed( $api_skus ) );
+    } else {
+        $log[] = [
+            'type'    => 'info',
+            'message' => 'Trash step skipped in test mode.',
+        ];
+    }
 
     delete_transient( TOTOSYNC_PROG_KEY );
     update_option( TOTOSYNC_LAST_OPT, time() );
     update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
-    error_log( '[ToToSync] Auto-sync done. ' . $total . ' products processed.' );
+    error_log( '[ToToSync] Sync done. ' . $total . ' items processed.' );
+}
+
+/**
+ * From all groups, select up to $limit items covering every sync scenario:
+ *
+ *  Scenario A — Variable with attributes + multiple variations + in stock:
+ *               Groups that have >1 item AND at least one item with colour or measurement AND qty > 0.
+ *  Scenario B — Variable with attributes + one variation (in or out of stock):
+ *               Groups that have exactly 1 item with colour or measurement.
+ *  Scenario C — No attributes (colour and measurement both empty):
+ *               Any group where all items lack colour and measurement.
+ *
+ * Groups are drawn from each bucket in round-robin order until $limit is reached.
+ *
+ * @param  array $groups  All groups keyed by product name.
+ * @param  int   $limit   Maximum total items to return.
+ * @return array          Trimmed groups array.
+ */
+function totosync_select_test_groups( array $groups, int $limit ): array {
+    $bucket_a = []; // multi-variation, has attributes, in-stock
+    $bucket_b = []; // single-variation, has attributes
+    $bucket_c = []; // no attributes at all
+
+    foreach ( $groups as $name => $items ) {
+        $has_attrs   = false;
+        $has_instock = false;
+        foreach ( $items as $item ) {
+            if ( trim( $item['colour'] ?? '' ) !== '' || trim( $item['measurement'] ?? '' ) !== '' ) {
+                $has_attrs = true;
+            }
+            if ( (int) ( $item['quantity'] ?? 0 ) > 0 ) {
+                $has_instock = true;
+            }
+        }
+
+        if ( ! $has_attrs ) {
+            $bucket_c[ $name ] = $items;
+        } elseif ( count( $items ) > 1 && $has_instock ) {
+            $bucket_a[ $name ] = $items;
+        } else {
+            $bucket_b[ $name ] = $items;
+        }
+    }
+
+    // Round-robin pull from buckets until the limit is reached.
+    $selected  = [];
+    $remaining = $limit;
+    $buckets   = array_filter( [ $bucket_a, $bucket_b, $bucket_c ] );
+
+    while ( $remaining > 0 && ! empty( $buckets ) ) {
+        foreach ( $buckets as $key => $bucket ) {
+            if ( $remaining <= 0 ) {
+                break;
+            }
+            // Pick the first group from this bucket.
+            reset( $bucket );
+            $gname = key( $bucket );
+            $items = $bucket[ $gname ];
+
+            // Clip the group's items if they alone exceed the remaining budget.
+            $items                  = array_slice( $items, 0, $remaining );
+            $selected[ $gname ]     = $items;
+            $remaining             -= count( $items );
+            unset( $buckets[ $key ][ $gname ] );
+
+            if ( empty( $buckets[ $key ] ) ) {
+                unset( $buckets[ $key ] );
+            }
+        }
+    }
+
+    return $selected;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
