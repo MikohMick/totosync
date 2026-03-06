@@ -29,7 +29,7 @@ define( 'TOTOSYNC_PROG_KEY',  'totosync_progress' );
 // Set to a positive integer to process only that many API items across a curated
 // mix of scenarios (multi-variation, single-variation, with/without attributes).
 // Set to 0 (or remove) to process the full catalogue.
-define( 'TOTOSYNC_TEST_LIMIT', 10 );
+define( 'TOTOSYNC_TEST_LIMIT', 0 );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
@@ -684,6 +684,11 @@ function totosync_add_term_to_parent( $parent_id, $taxonomy, $attr_id, $term_id 
     if ( $changed ) {
         $product->set_attributes( $attributes );
         $product->save();
+        // Bust WP's object cache and WC's product transients so the next
+        // wc_get_product() call for this parent (e.g. in a subsequent variation
+        // loop iteration) reloads fresh attribute data from the database.
+        wc_delete_product_transients( $parent_id );
+        clean_post_cache( $parent_id );
     }
 }
 
