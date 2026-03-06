@@ -36,7 +36,7 @@ define( 'TOTOSYNC_TEST_LIMIT', 0 );
 // this value. The full API is still fetched; only the matching product is synced.
 // Trash step is skipped so other products are not affected.
 // Set to '' (empty string) to process all products normally.
-define( 'TOTOSYNC_TEST_PRODUCT', 'Baby T-shirt Set Of 5' );
+define( 'TOTOSYNC_TEST_PRODUCT', '' );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
