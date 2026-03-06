@@ -31,6 +31,13 @@ define( 'TOTOSYNC_PROG_KEY',  'totosync_progress' );
 // Set to 0 (or remove) to process the full catalogue.
 define( 'TOTOSYNC_TEST_LIMIT', 0 );
 
+// ── Product name filter (for targeted testing) ─────────────────────────────────
+// Set to a non-empty string to process ONLY items whose itemName exactly matches
+// this value. The full API is still fetched; only the matching product is synced.
+// Trash step is skipped so other products are not affected.
+// Set to '' (empty string) to process all products normally.
+define( 'TOTOSYNC_TEST_PRODUCT', 'Baby T-shirt Set Of 5' );
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,12 +283,20 @@ function totosync_run_sync() {
         }
     }
 
+    // ── Product name filter ───────────────────────────────────────────────────
+    // When TOTOSYNC_TEST_PRODUCT is set, keep only the matching group so we can
+    // test a single product's full variation set without touching the rest.
+    $filter_name = defined( 'TOTOSYNC_TEST_PRODUCT' ) ? trim( TOTOSYNC_TEST_PRODUCT ) : '';
+    if ( $filter_name !== '' ) {
+        $groups = isset( $groups[ $filter_name ] ) ? [ $filter_name => $groups[ $filter_name ] ] : [];
+    }
+
     // ── Test mode ────────────────────────────────────────────────────────────
     // When TOTOSYNC_TEST_LIMIT > 0, select a curated mix of up to that many
     // items covering all sync scenarios, then skip the trash step so we don't
     // accidentally trash products not included in the test run.
-    $test_mode = defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0;
-    if ( $test_mode ) {
+    $test_mode = ( $filter_name !== '' ) || ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 );
+    if ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 ) {
         $groups = totosync_select_test_groups( $groups, TOTOSYNC_TEST_LIMIT );
     }
 
@@ -294,10 +309,16 @@ function totosync_run_sync() {
     }
 
     $total = count( $items_to_process );
-    $log   = [ [
+    $mode_label = '';
+    if ( $filter_name !== '' ) {
+        $mode_label = '[FILTER: "' . $filter_name . '"] ';
+    } elseif ( defined( 'TOTOSYNC_TEST_LIMIT' ) && TOTOSYNC_TEST_LIMIT > 0 ) {
+        $mode_label = '[TEST MODE – ' . TOTOSYNC_TEST_LIMIT . ' items] ';
+    }
+    $log = [ [
         'type'    => 'info',
-        'message' => ( $test_mode ? '[TEST MODE – ' . TOTOSYNC_TEST_LIMIT . ' items] ' : '' )
-                   . 'Sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
+        'message' => $mode_label . 'Sync started at ' . date( 'Y-m-d H:i:s' )
+                   . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
     ] ];
 
     set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
