@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Manual sync only — no automatic scheduling.
- * Version:     2.2.1
+ * Version:     2.3.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.2.1' );
+define( 'TOTOSYNC_VERSION',   '2.3.0' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
@@ -266,11 +266,25 @@ function totosync_run_sync() {
         'message' => 'Auto-sync started at ' . date( 'Y-m-d H:i:s' ) . ' (' . $total . ' products)',
     ] ];
 
+    // Group items by itemName — the name identifies the parent product;
+    // each item in the group becomes a variation regardless of attribute count.
+    $groups = [];
+    foreach ( $products as $item ) {
+        $name = trim( $item['itemName'] ?? '' );
+        if ( $name !== '' ) {
+            $groups[ $name ][] = $item;
+        }
+    }
+
     set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
 
-    foreach ( $products as $i => $item ) {
-        $log[] = totosync_process_product( $item );
-        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $i + 1, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+    $processed = 0;
+    foreach ( $groups as $items ) {
+        foreach ( $items as $item ) {
+            $log[] = totosync_process_product( $item );
+            $processed++;
+            set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+        }
     }
 
     // Trash products / variations that have disappeared from the API.
@@ -347,17 +361,12 @@ function totosync_process_product( array $item ) {
     }
 
     try {
-        // Route to variable whenever at least one attribute is present.
-        if ( $colour !== '' || $measurement !== '' ) {
-            return totosync_sync_variable(
-                $name, $sku, $colour, $measurement,
-                $price, $qty, $category, $description, $images
-            );
-        } else {
-            return totosync_sync_simple(
-                $name, $sku, $price, $qty, $category, $description, $images
-            );
-        }
+        // All products are variable — the name groups items into a parent;
+        // each API item becomes one variation under that parent.
+        return totosync_sync_variable(
+            $name, $sku, $colour, $measurement,
+            $price, $qty, $category, $description, $images
+        );
     } catch ( Throwable $e ) {
         error_log( '[ToToSync] Exception for SKU ' . $sku . ': ' . $e->getMessage() );
         return [ 'type' => 'error', 'message' => "SKU {$sku}: " . $e->getMessage() ];
@@ -684,71 +693,6 @@ function totosync_write_variation_attrs( $variation_id, $colour, $measurement ) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Simple product sync
-// ─────────────────────────────────────────────────────────────────────────────
-
-function totosync_sync_simple( $name, $sku, $price, $qty, $category, $description, $images ) {
-    $cat_id     = totosync_get_or_create_category( $category );
-    $product_id = $sku ? wc_get_product_id_by_sku( $sku ) : 0;
-
-    if ( ! $product_id ) {
-        // Fallback: look up by our custom meta.
-        $found = get_posts( [
-            'post_type'      => 'product',
-            'post_status'    => 'any',
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-            'meta_query'     => [ [ 'key' => '_totosync_item_name', 'value' => $name ] ],
-        ] );
-        if ( ! empty( $found ) ) {
-            $product_id = (int) $found[0];
-        }
-    }
-
-    if ( $product_id ) {
-        $product = wc_get_product( $product_id );
-        if ( $product ) {
-            $product->set_name( $name );
-            $product->set_sku( $sku );
-            $product->set_regular_price( $price );
-            $product->set_description( $description );
-            $product->set_category_ids( [ $cat_id ] );
-            $product->set_status( 'publish' ); // Restore if previously trashed.
-            totosync_set_stock( $product, $qty );
-            $product->save();
-
-            if ( ! has_post_thumbnail( $product_id ) && ! empty( $images ) ) {
-                totosync_attach_image( $product_id, $images[0] );
-            }
-
-            $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
-            return [ 'type' => 'success', 'message' => "Updated simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
-        }
-    }
-
-    // Create new simple product.
-    $product = new WC_Product_Simple();
-    $product->set_name( $name );
-    $product->set_sku( $sku );
-    $product->set_regular_price( $price );
-    $product->set_description( $description );
-    $product->set_category_ids( [ $cat_id ] );
-    $product->set_status( 'publish' );
-    totosync_set_stock( $product, $qty );
-    $new_id = $product->save();
-
-    if ( $new_id ) {
-        update_post_meta( $new_id, '_totosync_item_name', $name );
-        if ( ! empty( $images ) ) {
-            totosync_attach_image( $new_id, $images[0] );
-        }
-    }
-
-    $stock_msg = $qty > 0 ? "qty={$qty}" : 'out of stock';
-    return [ 'type' => 'success', 'message' => "Created simple product SKU {$sku} '{$name}' ({$stock_msg})" ];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Category helper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -932,19 +876,6 @@ function totosync_trash_removed( array $api_skus ) {
     foreach ( $managed_ids as $pid ) {
         $product = wc_get_product( $pid );
         if ( ! $product ) {
-            continue;
-        }
-
-        // ── Simple product ────────────────────────────────────────────────────
-        if ( $product->is_type( 'simple' ) ) {
-            $sku = $product->get_sku();
-            if ( $sku !== '' && ! isset( $api_set[ $sku ] ) ) {
-                wp_trash_post( $pid );
-                $log[] = [
-                    'type'    => 'info',
-                    'message' => "Trashed simple product SKU {$sku} '{$product->get_name()}' (removed from API)",
-                ];
-            }
             continue;
         }
 
