@@ -363,9 +363,17 @@ function totosync_debug_sync_sku( $target_sku ) {
 
     // ── Step 5: Run the sync for ALL items in this product group ──────────────
     $log[] = [ 'type' => 'info', 'message' => '⑤ Running sync for the full product group…' ];
+    $debug_parent_id = 0;
     foreach ( $siblings as $sibling ) {
         $result = totosync_process_product( $sibling );
         $log[]  = $result;
+        if ( ! empty( $result['parent_id'] ) ) {
+            $debug_parent_id = $result['parent_id'];
+        }
+    }
+    if ( $debug_parent_id ) {
+        WC_Product_Variable::sync( $debug_parent_id );
+        wc_delete_product_transients( $debug_parent_id );
     }
 
     // ── Step 6: Verify WooCommerce state after sync ───────────────────────────
@@ -501,14 +509,32 @@ function totosync_run_sync() {
 
     $processed      = 0;
     $confirmed_skus = []; // SKUs confirmed synced successfully — used for crosscheck below.
-    foreach ( $items_to_process as $item ) {
-        $result = totosync_process_product( $item );
-        $log[]  = $result;
-        if ( ( $result['type'] ?? '' ) === 'success' && ! empty( $result['sku'] ) ) {
-            $confirmed_skus[] = $result['sku'];
+
+    // Iterate by group so we can call WC_Product_Variable::sync() once per
+    // parent after ALL its variations are saved, rather than once per variation.
+    foreach ( $groups as $group_items ) {
+        $parent_id_to_sync = 0;
+        foreach ( $group_items as $item ) {
+            $result = totosync_process_product( $item );
+            $log[]  = $result;
+            if ( ( $result['type'] ?? '' ) === 'success' ) {
+                if ( ! empty( $result['sku'] ) ) {
+                    $confirmed_skus[] = $result['sku'];
+                }
+                if ( ! empty( $result['parent_id'] ) ) {
+                    $parent_id_to_sync = $result['parent_id'];
+                }
+            }
+            $processed++;
+            set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
         }
-        $processed++;
-        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+        // Rebuild the variation lookup table once now that every variation in
+        // this group has been saved — this is what controls which attribute
+        // options are enabled/disabled on the frontend product page.
+        if ( $parent_id_to_sync ) {
+            WC_Product_Variable::sync( $parent_id_to_sync );
+            wc_delete_product_transients( $parent_id_to_sync );
+        }
     }
 
     // ── SKU crosscheck ───────────────────────────────────────────────────────
@@ -762,19 +788,13 @@ function totosync_sync_variable(
         totosync_attach_image( $variation_id, $images[0] );
     }
 
-    // Rebuild the parent's variation lookup table so WooCommerce's frontend JS
-    // knows which attribute combinations are in/out of stock.  This must run
-    // after every variation save — including the SKU-match update path — so
-    // that colours/sizes are never incorrectly greyed out on the product page.
-    WC_Product_Variable::sync( $parent_id );
-    wc_delete_product_transients( $parent_id );
-
     $attr_parts = array_filter( [ $colour, $measurement ] );
     $stock_msg  = $qty > 0 ? "qty={$qty}" : 'out of stock';
     return [
-        'type'    => 'success',
-        'sku'     => $sku,
-        'message' => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
+        'type'      => 'success',
+        'sku'       => $sku,
+        'parent_id' => $parent_id,
+        'message'   => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
     ];
 }
 
@@ -997,7 +1017,6 @@ function totosync_get_or_create_variation(
             totosync_set_stock( $child, $qty );
             $child->save();
             totosync_write_variation_attrs( $child_id, $colour, $measurement );
-            WC_Product_Variable::sync( $parent_id );
             return $child_id;
         }
     }
@@ -1014,7 +1033,6 @@ function totosync_get_or_create_variation(
 
     if ( $new_id ) {
         totosync_write_variation_attrs( $new_id, $colour, $measurement );
-        WC_Product_Variable::sync( $parent_id );
     }
 
     return $new_id ?: false;
