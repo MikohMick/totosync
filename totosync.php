@@ -275,11 +275,14 @@ function totosync_run_sync() {
 
     // Group items by itemName — the name identifies the parent product;
     // each item in the group becomes a variation regardless of attribute count.
-    $groups = [];
+    $groups        = [];
+    $skipped_early = []; // items dropped before processing (no itemName)
     foreach ( $products as $item ) {
         $name = trim( $item['itemName'] ?? '' );
         if ( $name !== '' ) {
             $groups[ $name ][] = $item;
+        } else {
+            $skipped_early[] = $item;
         }
     }
 
@@ -318,16 +321,55 @@ function totosync_run_sync() {
     $log = [ [
         'type'    => 'info',
         'message' => $mode_label . 'Sync started at ' . date( 'Y-m-d H:i:s' )
-                   . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
+                   . ' — API returned ' . count( $products ) . ' items'
+                   . ( count( $skipped_early ) ? ', ' . count( $skipped_early ) . ' had no name and were skipped' : '' )
+                   . ' (' . $total . ' to process across ' . count( $groups ) . ' products)',
     ] ];
+
+    // Warn about every nameless item upfront.
+    foreach ( $skipped_early as $bad ) {
+        $id  = $bad['itemId']   ?? '?';
+        $sku = trim( $bad['itemCode'] ?? '' );
+        $log[] = [
+            'type'    => 'warning',
+            'message' => "Skipped: item ID {$id}" . ( $sku ? " (SKU {$sku})" : '' ) . ' has no itemName — cannot be synced.',
+        ];
+    }
 
     set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
 
-    $processed = 0;
+    $processed      = 0;
+    $confirmed_skus = []; // SKUs confirmed synced successfully — used for crosscheck below.
     foreach ( $items_to_process as $item ) {
-        $log[] = totosync_process_product( $item );
+        $result = totosync_process_product( $item );
+        $log[]  = $result;
+        if ( ( $result['type'] ?? '' ) === 'success' && ! empty( $result['sku'] ) ) {
+            $confirmed_skus[] = $result['sku'];
+        }
         $processed++;
         set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+    }
+
+    // ── SKU crosscheck ───────────────────────────────────────────────────────
+    // Compare every SKU the API sent against the ones confirmed synced.
+    // Any gap means an item was attempted but failed (error logged above) OR
+    // had no SKU at all. Surface these clearly so nothing silently slips through.
+    $api_item_skus = array_filter( array_map(
+        fn( $i ) => trim( $i['itemCode'] ?? '' ),
+        $items_to_process
+    ) );
+    $missed_skus = array_diff( $api_item_skus, $confirmed_skus );
+    if ( ! empty( $missed_skus ) ) {
+        $log[] = [
+            'type'    => 'warning',
+            'message' => 'SKU CROSSCHECK — ' . count( $missed_skus ) . ' item(s) were NOT confirmed synced: '
+                       . implode( ', ', $missed_skus ),
+        ];
+    } else {
+        $log[] = [
+            'type'    => 'info',
+            'message' => 'SKU crosscheck passed — all ' . count( $confirmed_skus ) . ' processed items confirmed synced.',
+        ];
     }
 
     // Trash removed products — skipped in test mode since we intentionally
@@ -347,7 +389,16 @@ function totosync_run_sync() {
 
     delete_transient( TOTOSYNC_PROG_KEY );
     update_option( TOTOSYNC_LAST_OPT, time() );
-    update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
+
+    // Save up to 500 log entries. Always preserve ALL errors and warnings;
+    // only trim info/success entries when the cap would otherwise be exceeded.
+    $log_cap     = 500;
+    $critical    = array_values( array_filter( $log, fn( $e ) => in_array( $e['type'] ?? '', [ 'error', 'warning' ], true ) ) );
+    $informative = array_values( array_filter( $log, fn( $e ) => ! in_array( $e['type'] ?? '', [ 'error', 'warning' ], true ) ) );
+    $remaining   = max( 0, $log_cap - count( $critical ) );
+    $log_to_save = array_merge( $critical, array_slice( $informative, 0, $remaining ) );
+    update_option( TOTOSYNC_LOG_OPT, $log_to_save );
+
     error_log( '[ToToSync] Sync done. ' . $total . ' items processed.' );
 }
 
@@ -429,7 +480,7 @@ function totosync_select_test_groups( array $groups, int $limit ): array {
 
 function totosync_fetch_products() {
     $response = wp_remote_get( TOTOSYNC_API_URL, [
-        'timeout'    => 30,
+        'timeout'    => 60,
         'user-agent' => 'ToToSync/' . TOTOSYNC_VERSION,
     ] );
 
@@ -557,6 +608,7 @@ function totosync_sync_variable(
     $stock_msg  = $qty > 0 ? "qty={$qty}" : 'out of stock';
     return [
         'type'    => 'success',
+        'sku'     => $sku,
         'message' => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
     ];
 }
@@ -586,8 +638,16 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
                 wp_set_object_terms( $found[0], 'variable', 'product_type' );
                 $product = new WC_Product_Variable( $found[0] );
             }
-            // Update category; restore from trash if it was removed previously.
-            $product->set_category_ids( [ $cat_id ] );
+            // Merge the API category with whatever categories the client has
+            // manually assigned — never wipe out manually-added categories.
+            // If the API sends no category (cat_id=0) leave existing cats alone.
+            if ( $cat_id ) {
+                $existing_cats = $product->get_category_ids();
+                if ( ! in_array( $cat_id, $existing_cats, true ) ) {
+                    $product->set_category_ids( array_values( array_merge( $existing_cats, [ $cat_id ] ) ) );
+                }
+            }
+            // Restore from trash if it was removed previously.
             $product->set_status( 'publish' );
             $product->save();
         }
@@ -598,7 +658,9 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
     $product->set_name( $name );
     $product->set_description( $description );
     $product->set_status( 'publish' );
-    $product->set_category_ids( [ $cat_id ] );
+    if ( $cat_id ) {
+        $product->set_category_ids( [ $cat_id ] );
+    }
     $id = $product->save();
 
     if ( $id ) {
