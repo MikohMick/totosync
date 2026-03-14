@@ -307,7 +307,7 @@ function totosync_debug_sync_sku( $target_sku ) {
     $log[] = [ 'type' => 'info', 'message' => '   API returned ' . count( $products ) . ' items.' ];
 
     // ── Step 2: Locate the SKU in the API response ────────────────────────────
-    $log[] = [ 'type' => 'info', 'message' => "② Looking for SKU "{$target_sku}" in API response…" ];
+    $log[] = [ 'type' => 'info', 'message' => '② Looking for SKU "' . $target_sku . '" in API response...' ];
 
     $match = null;
     foreach ( $products as $item ) {
@@ -318,7 +318,7 @@ function totosync_debug_sync_sku( $target_sku ) {
     }
 
     if ( ! $match ) {
-        $log[] = [ 'type' => 'error', 'message' => "   SKU "{$target_sku}" was NOT found in the API response." ];
+        $log[] = [ 'type' => 'error', 'message' => '   SKU "' . $target_sku . '" was NOT found in the API response.' ];
         $sample = array_slice(
             array_filter( array_map( fn( $i ) => trim( $i['itemCode'] ?? '' ), $products ) ),
             0, 15
@@ -341,7 +341,7 @@ function totosync_debug_sync_sku( $target_sku ) {
     // ── Step 3: Find sibling variations (same parent product group) ───────────
     $parent_name = trim( $match['itemName'] ?? '' );
     $siblings    = array_filter( $products, fn( $i ) => trim( $i['itemName'] ?? '' ) === $parent_name );
-    $log[] = [ 'type' => 'info', 'message' => "③ Parent product group "{$parent_name}" has " . count( $siblings ) . ' variation(s) in the API.' ];
+    $log[] = [ 'type' => 'info', 'message' => '③ Parent product group "' . $parent_name . '" has ' . count( $siblings ) . ' variation(s) in the API.' ];
     foreach ( $siblings as $s ) {
         $s_sku   = trim( $s['itemCode']    ?? '' );
         $s_col   = trim( $s['colour']      ?? '' );
@@ -382,7 +382,7 @@ function totosync_debug_sync_sku( $target_sku ) {
             $parent     = wc_get_product( $parent_id );
             $cats       = wp_get_post_terms( $parent_id, 'product_cat', [ 'fields' => 'names' ] );
             $cat_string = ! is_wp_error( $cats ) && $cats ? implode( ', ', $cats ) : '(none)';
-            $log[] = [ 'type' => 'info', 'message' => "     parent : ID {$parent_id} — "" . $parent->get_name() . '"', status: ' . $parent->get_status() ];
+            $log[] = [ 'type' => 'info', 'message' => '     parent : ID ' . $parent_id . ' — "' . $parent->get_name() . '", status: ' . $parent->get_status() ];
             $log[] = [ 'type' => 'info', 'message' => "     categories: {$cat_string}" ];
 
             // Count live (non-trashed) variations on the parent.
