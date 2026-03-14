@@ -762,7 +762,11 @@ function totosync_sync_variable(
         totosync_attach_image( $variation_id, $images[0] );
     }
 
-    // Bust the parent's cached price range so WooCommerce recalculates it.
+    // Rebuild the parent's variation lookup table so WooCommerce's frontend JS
+    // knows which attribute combinations are in/out of stock.  This must run
+    // after every variation save — including the SKU-match update path — so
+    // that colours/sizes are never incorrectly greyed out on the product page.
+    WC_Product_Variable::sync( $parent_id );
     wc_delete_product_transients( $parent_id );
 
     $attr_parts = array_filter( [ $colour, $measurement ] );
