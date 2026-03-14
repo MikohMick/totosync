@@ -128,4 +128,73 @@ jQuery( function ( $ ) {
     function escHtml( str ) {
         return $( '<span>' ).text( str ).html();
     }
+
+    // ── Debug / Retry panel ───────────────────────────────────────────────────
+    var $debugBtn     = $( '#totosync-debug-btn' );
+    var $debugSku     = $( '#totosync-debug-sku' );
+    var $debugSpinner = $( '#totosync-debug-spinner' );
+    var $debugOutput  = $( '#totosync-debug-output' );
+    var $debugLog     = $( '#totosync-debug-log' );
+
+    $debugBtn.on( 'click', function () {
+        var sku = $.trim( $debugSku.val() );
+        if ( ! sku ) {
+            alert( 'Please enter a SKU first.' );
+            return;
+        }
+
+        $debugBtn.prop( 'disabled', true );
+        $debugSpinner.css( 'visibility', 'visible' );
+        $debugLog.empty();
+        $debugOutput.show();
+        $debugLog.append(
+            '<li style="color:#555;">Fetching API and running debug sync for SKU <strong>' +
+            escHtml( sku ) + '</strong>\u2026</li>'
+        );
+
+        $.post( totosyncAdmin.ajaxurl, {
+            action: 'totosync_debug_item',
+            nonce:  totosyncAdmin.nonce,
+            sku:    sku,
+        } )
+        .done( function ( res ) {
+            $debugLog.empty();
+            if ( ! res.success ) {
+                $debugLog.append(
+                    '<li style="color:#c00;">' + escHtml( res.data || 'Server error.' ) + '</li>'
+                );
+                return;
+            }
+
+            var entries = res.data.log || [];
+            entries.forEach( function ( entry ) {
+                var color = entry.type === 'error'   ? '#c00'
+                          : entry.type === 'warning' ? '#996600'
+                          : entry.type === 'success' ? '#008a00'
+                          : '#333';
+                $debugLog.append(
+                    '<li style="color:' + color + ';margin-bottom:2px;">' +
+                    escHtml( entry.message ) + '</li>'
+                );
+            } );
+
+            // Scroll to bottom so the final verification result is visible.
+            $debugLog[0].scrollTop = $debugLog[0].scrollHeight;
+        } )
+        .fail( function () {
+            $debugLog.empty();
+            $debugLog.append( '<li style="color:#c00;">Request failed — could not reach the server.</li>' );
+        } )
+        .always( function () {
+            $debugBtn.prop( 'disabled', false );
+            $debugSpinner.css( 'visibility', 'hidden' );
+        } );
+    } );
+
+    // Allow pressing Enter in the SKU field to trigger the debug.
+    $debugSku.on( 'keydown', function ( e ) {
+        if ( e.key === 'Enter' ) {
+            $debugBtn.trigger( 'click' );
+        }
+    } );
 } );

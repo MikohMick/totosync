@@ -5,7 +5,7 @@
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
  *              Manual sync only — no automatic scheduling.
- * Version:     2.3.0
+ * Version:     2.4.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.3.0' );
+define( 'TOTOSYNC_VERSION',   '2.4.0' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
@@ -47,8 +47,9 @@ register_deactivation_hook( __FILE__, 'totosync_deactivate' );
 
 add_action( 'admin_menu',            'totosync_admin_menu' );
 add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
-add_action( 'wp_ajax_totosync_start_sync', 'totosync_ajax_start_sync' );
-add_action( 'wp_ajax_totosync_poll',       'totosync_ajax_poll' );
+add_action( 'wp_ajax_totosync_start_sync',  'totosync_ajax_start_sync' );
+add_action( 'wp_ajax_totosync_poll',        'totosync_ajax_poll' );
+add_action( 'wp_ajax_totosync_debug_item',  'totosync_ajax_debug_item' );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation / Deactivation
@@ -175,6 +176,30 @@ function totosync_page() {
     echo '<div id="totosync-result" style="margin-top:8px;"></div>';
     echo '</div>';
 
+    // ── Debug / Retry panel ───────────────────────────────────────────────────
+    echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+       . 'margin-top:24px;border-radius:4px;max-width:660px;">';
+    echo '<h2 style="margin-top:0">Debug / Retry a Single Item</h2>';
+    echo '<p style="color:#555;font-size:13px;margin-top:0;">'
+       . 'Enter a SKU (itemCode) from the POS system. ToToSync will fetch the full API, '
+       . 'show exactly what the POS is sending for that item, run the sync, '
+       . 'then verify the result in WooCommerce — step by step.</p>';
+
+    echo '<div style="display:flex;gap:8px;align-items:flex-start;">';
+    echo '<input id="totosync-debug-sku" type="text" class="regular-text" '
+       . 'placeholder="e.g. 2848" style="height:36px;font-size:14px;" />';
+    echo '<button id="totosync-debug-btn" class="button button-secondary" '
+       . 'style="height:36px;padding:0 16px;font-size:14px;">Debug &amp; Sync</button>';
+    echo '<span id="totosync-debug-spinner" class="spinner" '
+       . 'style="float:none;margin:4px 0 0 4px;vertical-align:middle;visibility:hidden;"></span>';
+    echo '</div>';
+
+    echo '<div id="totosync-debug-output" style="margin-top:14px;display:none;">'
+       . '<ul id="totosync-debug-log" style="max-height:340px;overflow-y:auto;'
+       . 'padding-left:20px;margin:0;font-size:12px;font-family:monospace;"></ul>'
+       . '</div>';
+    echo '</div>';
+
     // ── Sync log ─────────────────────────────────────────────────────────────
     if ( ! empty( $log ) ) {
         echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
@@ -239,6 +264,142 @@ function totosync_ajax_start_sync() {
         'started'   => true,
         'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
     ] );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AJAX handler — debug / retry a single item by SKU
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Synchronous (inline) AJAX handler — safe for a single item because it
+ * completes well within PHP's max_execution_time for one variation group.
+ */
+function totosync_ajax_debug_item() {
+    check_ajax_referer( 'totosync_nonce', 'nonce' );
+
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized', 403 );
+    }
+
+    $sku = trim( sanitize_text_field( $_POST['sku'] ?? '' ) );
+    if ( $sku === '' ) {
+        wp_send_json_error( 'No SKU entered.' );
+    }
+
+    wp_send_json_success( [ 'log' => totosync_debug_sync_sku( $sku ) ] );
+}
+
+/**
+ * Fetch the API, find every item whose itemCode matches $target_sku,
+ * run the sync for the whole parent-product group it belongs to,
+ * then verify the WooCommerce state — all with step-by-step logging.
+ */
+function totosync_debug_sync_sku( $target_sku ) {
+    $log = [];
+
+    // ── Step 1: Fetch the API ─────────────────────────────────────────────────
+    $log[] = [ 'type' => 'info', 'message' => '① Fetching POS API…' ];
+    $products = totosync_fetch_products();
+    if ( is_wp_error( $products ) ) {
+        $log[] = [ 'type' => 'error', 'message' => 'API fetch failed: ' . $products->get_error_message() ];
+        return $log;
+    }
+    $log[] = [ 'type' => 'info', 'message' => '   API returned ' . count( $products ) . ' items.' ];
+
+    // ── Step 2: Locate the SKU in the API response ────────────────────────────
+    $log[] = [ 'type' => 'info', 'message' => "② Looking for SKU "{$target_sku}" in API response…" ];
+
+    $match = null;
+    foreach ( $products as $item ) {
+        if ( trim( $item['itemCode'] ?? '' ) === $target_sku ) {
+            $match = $item;
+            break;
+        }
+    }
+
+    if ( ! $match ) {
+        $log[] = [ 'type' => 'error', 'message' => "   SKU "{$target_sku}" was NOT found in the API response." ];
+        $sample = array_slice(
+            array_filter( array_map( fn( $i ) => trim( $i['itemCode'] ?? '' ), $products ) ),
+            0, 15
+        );
+        $log[] = [ 'type' => 'info', 'message' => '   First 15 SKUs the API returned: ' . implode( ', ', $sample ) ];
+        return $log;
+    }
+
+    $log[] = [ 'type' => 'success', 'message' => '   Found in API:' ];
+    $log[] = [ 'type' => 'info',    'message' => '     itemName    : ' . ( $match['itemName']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     itemCode    : ' . ( $match['itemCode']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     colour      : ' . ( $match['colour']          ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     measurement : ' . ( $match['measurement']     ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     quantity    : ' . ( $match['quantity']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     price       : ' . ( $match['price1']          ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     category    : ' . ( $match['productCategory'] ?? '(empty)' ) ];
+    $images = $match['imageUrls'] ?? [];
+    $log[] = [ 'type' => 'info',    'message' => '     imageUrls   : ' . ( $images ? implode( ', ', (array) $images ) : '(none)' ) ];
+
+    // ── Step 3: Find sibling variations (same parent product group) ───────────
+    $parent_name = trim( $match['itemName'] ?? '' );
+    $siblings    = array_filter( $products, fn( $i ) => trim( $i['itemName'] ?? '' ) === $parent_name );
+    $log[] = [ 'type' => 'info', 'message' => "③ Parent product group "{$parent_name}" has " . count( $siblings ) . ' variation(s) in the API.' ];
+    foreach ( $siblings as $s ) {
+        $s_sku   = trim( $s['itemCode']    ?? '' );
+        $s_col   = trim( $s['colour']      ?? '' );
+        $s_meas  = trim( $s['measurement'] ?? '' );
+        $s_qty   = $s['quantity'] ?? 0;
+        $flag    = $s_sku === $target_sku ? ' ◀ (this item)' : '';
+        $log[] = [ 'type' => 'info', 'message' => "     SKU {$s_sku}: {$s_col} / {$s_meas}, qty={$s_qty}{$flag}" ];
+    }
+
+    // ── Step 4: Check current WooCommerce state before sync ───────────────────
+    $log[] = [ 'type' => 'info', 'message' => '④ Checking WooCommerce state before sync…' ];
+    $before_id = wc_get_product_id_by_sku( $target_sku );
+    if ( $before_id ) {
+        $before = wc_get_product( $before_id );
+        $log[] = [ 'type' => 'info', 'message' => "   Found existing product ID {$before_id} — type: " . $before->get_type() . ', status: ' . $before->get_status() . ', stock: ' . $before->get_stock_quantity() ];
+    } else {
+        $log[] = [ 'type' => 'info', 'message' => "   SKU {$target_sku} does not yet exist in WooCommerce." ];
+    }
+
+    // ── Step 5: Run the sync for ALL items in this product group ──────────────
+    $log[] = [ 'type' => 'info', 'message' => '⑤ Running sync for the full product group…' ];
+    foreach ( $siblings as $sibling ) {
+        $result = totosync_process_product( $sibling );
+        $log[]  = $result;
+    }
+
+    // ── Step 6: Verify WooCommerce state after sync ───────────────────────────
+    $log[]    = [ 'type' => 'info', 'message' => '⑥ Verifying WooCommerce state after sync…' ];
+    $after_id = wc_get_product_id_by_sku( $target_sku );
+    if ( $after_id ) {
+        $after     = wc_get_product( $after_id );
+        $parent_id = $after->get_parent_id();
+        $log[] = [ 'type' => 'success', 'message' => "   ✓ SKU {$target_sku} exists in WooCommerce as product ID {$after_id}" ];
+        $log[] = [ 'type' => 'info',    'message' => '     type   : ' . $after->get_type() ];
+        $log[] = [ 'type' => 'info',    'message' => '     status : ' . $after->get_status() ];
+        $log[] = [ 'type' => 'info',    'message' => '     stock  : ' . $after->get_stock_quantity() ];
+        if ( $parent_id ) {
+            $parent     = wc_get_product( $parent_id );
+            $cats       = wp_get_post_terms( $parent_id, 'product_cat', [ 'fields' => 'names' ] );
+            $cat_string = ! is_wp_error( $cats ) && $cats ? implode( ', ', $cats ) : '(none)';
+            $log[] = [ 'type' => 'info', 'message' => "     parent : ID {$parent_id} — "" . $parent->get_name() . '"', status: ' . $parent->get_status() ];
+            $log[] = [ 'type' => 'info', 'message' => "     categories: {$cat_string}" ];
+
+            // Count live (non-trashed) variations on the parent.
+            $live_vars = get_posts( [
+                'post_type'      => 'product_variation',
+                'post_parent'    => $parent_id,
+                'post_status'    => 'publish',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ] );
+            $log[] = [ 'type' => 'info', 'message' => '     live variations on parent: ' . count( $live_vars ) ];
+        }
+    } else {
+        $log[] = [ 'type' => 'error', 'message' => "   ✗ After sync, SKU {$target_sku} still not found in WooCommerce. Check the error entries above for the cause." ];
+    }
+
+    return $log;
 }
 
 /**
