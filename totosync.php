@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/MikohMick/totosync
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
- *              Manual sync only — no automatic scheduling.
+ *              Supports manual sync and configurable auto-sync (15 / 30 / 60 min).
  * Version:     2.4.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
@@ -47,9 +47,13 @@ register_deactivation_hook( __FILE__, 'totosync_deactivate' );
 
 add_action( 'admin_menu',            'totosync_admin_menu' );
 add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
-add_action( 'wp_ajax_totosync_start_sync',  'totosync_ajax_start_sync' );
-add_action( 'wp_ajax_totosync_poll',        'totosync_ajax_poll' );
-add_action( 'wp_ajax_totosync_debug_item',  'totosync_ajax_debug_item' );
+add_action( 'wp_ajax_totosync_start_sync',    'totosync_ajax_start_sync' );
+add_action( 'wp_ajax_totosync_poll',          'totosync_ajax_poll' );
+add_action( 'wp_ajax_totosync_debug_item',    'totosync_ajax_debug_item' );
+add_action( 'wp_ajax_totosync_autosync_save', 'totosync_ajax_autosync_save' );
+add_action( 'wp_ajax_totosync_autosync_log',  'totosync_ajax_autosync_log' );
+
+require_once __DIR__ . '/autosync.php';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation / Deactivation
@@ -66,6 +70,8 @@ function totosync_deactivate() {
     // Clear runtime transients so a stale lock can't block the next manual sync.
     delete_transient( 'totosync_running' );
     delete_transient( TOTOSYNC_PROG_KEY );
+    // Cancel any pending autosync jobs.
+    totosync_autosync_cancel();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,13 +101,19 @@ function totosync_enqueue_scripts( $hook ) {
         TOTOSYNC_VERSION,
         true
     );
-    $prog = get_transient( TOTOSYNC_PROG_KEY );
+    $prog    = get_transient( TOTOSYNC_PROG_KEY );
+    $next_ts = function_exists( 'as_next_scheduled_action' )
+        ? as_next_scheduled_action( TOTOSYNC_AUTOSYNC_HOOK, [], TOTOSYNC_AUTOSYNC_GROUP )
+        : false;
     wp_localize_script( 'totosync-admin', 'totosyncAdmin', [
-        'ajaxurl'   => admin_url( 'admin-ajax.php' ),
-        'nonce'     => wp_create_nonce( 'totosync_nonce' ),
-        'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
-        'running'   => get_transient( 'totosync_running' ) ? true : false,
-        'progress'  => $prog ? $prog : null,
+        'ajaxurl'          => admin_url( 'admin-ajax.php' ),
+        'nonce'            => wp_create_nonce( 'totosync_nonce' ),
+        'last_sync'        => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
+        'running'          => get_transient( 'totosync_running' ) ? true : false,
+        'progress'         => $prog ? $prog : null,
+        'autosync_enabled' => (bool) get_option( TOTOSYNC_AUTOSYNC_EN_OPT, false ),
+        'autosync_interval'=> (int)  get_option( TOTOSYNC_AUTOSYNC_IV_OPT, 1800 ),
+        'autosync_next'    => $next_ts ? (int) $next_ts : 0,
     ] );
 }
 
@@ -215,6 +227,72 @@ function totosync_page() {
         echo '</ul>';
         echo '</div>';
     }
+
+    // ── Auto Sync panel ───────────────────────────────────────────────────────
+    $as_enabled  = (bool) get_option( TOTOSYNC_AUTOSYNC_EN_OPT, false );
+    $as_interval = (int)  get_option( TOTOSYNC_AUTOSYNC_IV_OPT, 1800 );
+    $as_next     = function_exists( 'as_next_scheduled_action' )
+        ? as_next_scheduled_action( TOTOSYNC_AUTOSYNC_HOOK, [], TOTOSYNC_AUTOSYNC_GROUP )
+        : false;
+
+    echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+       . 'margin-top:24px;border-radius:4px;max-width:660px;">';
+    echo '<h2 style="margin-top:0">Auto Sync</h2>';
+    echo '<p style="color:#555;font-size:13px;margin-top:0;">'
+       . 'When enabled, ToToSync will run automatically on the selected schedule '
+       . 'using WooCommerce\'s Action Scheduler. The first run fires immediately '
+       . 'after saving.</p>';
+
+    // Settings row.
+    echo '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">';
+
+    // Toggle.
+    echo '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">';
+    echo '<input type="checkbox" id="totosync-autosync-enabled"'
+       . ( $as_enabled ? ' checked' : '' ) . '>';
+    echo '<strong>Enable Auto Sync</strong></label>';
+
+    // Interval dropdown.
+    echo '<label style="font-size:13px;">Interval:&nbsp;';
+    echo '<select id="totosync-autosync-interval" style="height:30px;">';
+    foreach ( [ 900 => 'Every 15 minutes', 1800 => 'Every 30 minutes', 3600 => 'Every 60 minutes' ] as $secs => $label ) {
+        $sel = ( $as_interval === $secs ) ? ' selected' : '';
+        echo '<option value="' . $secs . '"' . $sel . '>' . $label . '</option>';
+    }
+    echo '</select></label>';
+
+    // Save button.
+    echo '<button id="totosync-autosync-save" class="button button-primary" '
+       . 'style="height:30px;padding:0 14px;font-size:13px;">Save</button>';
+    echo '<span id="totosync-autosync-save-msg" style="font-size:12px;color:#555;"></span>';
+
+    echo '</div>'; // settings row
+
+    // Next run info (updated by JS after save).
+    echo '<p id="totosync-autosync-next" style="font-size:12px;color:#555;margin:10px 0 0;">';
+    if ( $as_enabled && $as_next && $as_next > time() ) {
+        echo 'Next run: <strong>'
+           . esc_html( date_i18n( 'D, d M Y H:i:s', $as_next ) )
+           . '</strong> (' . esc_html( human_time_diff( $as_next, time() ) ) . ' away)';
+    } elseif ( $as_enabled ) {
+        echo 'Immediate run queued&hellip;';
+    }
+    echo '</p>';
+
+    // Log viewer — always rendered, hidden/shown by JS.
+    echo '<div id="totosync-autosync-log-wrap" style="margin-top:16px;'
+       . ( $as_enabled ? '' : 'display:none;' ) . '">';
+    echo '<h3 style="margin:0 0 4px;font-size:13px;">Last Auto Sync Log</h3>';
+    echo '<p style="font-size:12px;color:#888;margin:0 0 6px;">Refreshes every 5 seconds.</p>';
+    echo '<pre id="totosync-autosync-log" '
+       . 'style="max-height:320px;overflow-y:auto;background:#f6f7f7;padding:12px;'
+       . 'font-size:11px;line-height:1.6;border:1px solid #ccd0d4;border-radius:3px;'
+       . 'white-space:pre-wrap;word-break:break-all;margin:0;">'
+       . 'No log yet — waiting for first run&hellip;'
+       . '</pre>';
+    echo '</div>';
+
+    echo '</div>'; // autosync panel
 
     echo '</div>'; // .wrap
 }

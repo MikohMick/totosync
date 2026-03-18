@@ -197,4 +197,108 @@ jQuery( function ( $ ) {
             $debugBtn.trigger( 'click' );
         }
     } );
+
+    // ── Auto Sync panel ───────────────────────────────────────────────────────
+    var $asEnabled  = $( '#totosync-autosync-enabled' );
+    var $asInterval = $( '#totosync-autosync-interval' );
+    var $asSave     = $( '#totosync-autosync-save' );
+    var $asSaveMsg  = $( '#totosync-autosync-save-msg' );
+    var $asLogWrap  = $( '#totosync-autosync-log-wrap' );
+    var $asLog      = $( '#totosync-autosync-log' );
+    var $asNext     = $( '#totosync-autosync-next' );
+
+    var asLogTimer  = null;
+    var AS_LOG_POLL = 5000; // ms
+
+    // Start log polling if autosync is already enabled on page load.
+    if ( totosyncAdmin.autosync_enabled ) {
+        scheduleLogPoll();
+        fetchLog(); // Fetch immediately so the log is visible straight away.
+    }
+
+    // Show / hide the log viewer when the toggle changes.
+    $asEnabled.on( 'change', function () {
+        if ( $( this ).is( ':checked' ) ) {
+            $asLogWrap.show();
+        } else {
+            $asLogWrap.hide();
+            stopLogPoll();
+        }
+    } );
+
+    // Save button.
+    $asSave.on( 'click', function () {
+        $asSave.prop( 'disabled', true );
+        $asSaveMsg.text( 'Saving\u2026' );
+
+        $.post( totosyncAdmin.ajaxurl, {
+            action:   'totosync_autosync_save',
+            nonce:    totosyncAdmin.nonce,
+            enabled:  $asEnabled.is( ':checked' ) ? 1 : 0,
+            interval: $asInterval.val(),
+        } )
+        .done( function ( res ) {
+            if ( ! res.success ) {
+                $asSaveMsg.css( 'color', '#c00' ).text( res.data || 'Error saving settings.' );
+                return;
+            }
+
+            var d = res.data;
+            $asSaveMsg.css( 'color', '#008a00' ).text( 'Saved!' );
+            setTimeout( function () { $asSaveMsg.text( '' ); }, 3000 );
+
+            // Update next-run text.
+            if ( d.enabled && d.next_run > 0 ) {
+                var nextDate = new Date( d.next_run * 1000 );
+                $asNext.html(
+                    'Next run: <strong>' + nextDate.toLocaleString() + '</strong>'
+                );
+            } else if ( d.enabled ) {
+                $asNext.html( 'Immediate run queued&hellip;' );
+            } else {
+                $asNext.html( '' );
+            }
+
+            // Start / stop log polling based on new state.
+            if ( d.enabled ) {
+                $asLogWrap.show();
+                scheduleLogPoll();
+                fetchLog();
+            } else {
+                $asLogWrap.hide();
+                stopLogPoll();
+            }
+        } )
+        .fail( function () {
+            $asSaveMsg.css( 'color', '#c00' ).text( 'Request failed — could not reach the server.' );
+        } )
+        .always( function () {
+            $asSave.prop( 'disabled', false );
+        } );
+    } );
+
+    function scheduleLogPoll() {
+        stopLogPoll();
+        asLogTimer = setInterval( fetchLog, AS_LOG_POLL );
+    }
+
+    function stopLogPoll() {
+        clearInterval( asLogTimer );
+        asLogTimer = null;
+    }
+
+    function fetchLog() {
+        $.post( totosyncAdmin.ajaxurl, {
+            action: 'totosync_autosync_log',
+            nonce:  totosyncAdmin.nonce,
+        } )
+        .done( function ( res ) {
+            if ( res.success && res.data.log ) {
+                var content = res.data.log;
+                $asLog.text( content );
+                // Keep scrolled to bottom so the latest entries are visible.
+                $asLog[0].scrollTop = $asLog[0].scrollHeight;
+            }
+        } );
+    }
 } );
