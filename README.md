@@ -1,9 +1,10 @@
 # ToToSync — WooCommerce POS Product Sync
 
-Syncs featured products from a POS API into WooCommerce on demand.
-Handles simple products, variable products (Colour + Measurement attributes),
-images, prices, stock levels, and automatic trash/restore when items appear
-or disappear from the API.
+Syncs featured products from a POS API into WooCommerce. Handles simple
+products, variable products (Colour + Measurement attributes), images, prices,
+stock levels, and automatic trash/restore when items appear or disappear from
+the API. Supports manual sync and configurable automatic sync (15 / 30 / 60
+minutes) via WooCommerce's built-in Action Scheduler.
 
 ---
 
@@ -22,6 +23,7 @@ or disappear from the API.
 1. Upload the `totosync` folder to `/wp-content/plugins/totosync/`
    ```
    /wp-content/plugins/totosync/totosync.php
+   /wp-content/plugins/totosync/autosync.php
    /wp-content/plugins/totosync/sync-listener.php
    /wp-content/plugins/totosync/script.js
    ```
@@ -32,6 +34,8 @@ or disappear from the API.
 
 ## Usage
 
+### Manual sync
+
 1. Go to **WordPress Admin → ToToSync**.
 2. The **Status** card shows when the last sync ran and the API endpoint in use.
 3. Click **Sync Now** to pull the latest products from the POS.
@@ -40,6 +44,25 @@ or disappear from the API.
 
 The button responds instantly — the sync runs in the background so you can
 navigate away at any time and it will still complete.
+
+### Auto Sync
+
+The **Auto Sync** panel at the bottom of the page lets the plugin run on a
+schedule without any server-side cron configuration.
+
+1. Tick **Enable Auto Sync**.
+2. Choose an interval: **Every 15 / 30 / 60 minutes**.
+3. Click **Save**.
+
+On first enable the sync fires immediately, then repeats on the selected
+interval. The **Next run** timestamp is shown after saving.
+
+Each auto-sync run overwrites `wp-content/uploads/totosync/autosync.log`
+with the results of that run (previous log is discarded). The log viewer on
+the admin page refreshes every 5 seconds via AJAX while the page is open.
+
+Disabling auto-sync (or deactivating the plugin) cancels all pending
+scheduled actions cleanly.
 
 ---
 
@@ -90,9 +113,25 @@ Deactivate and reactivate the plugin to regenerate the listener secret, then
 try again. If it still hangs, check that `sync-listener.php` is present in
 the plugin folder and readable by the web server.
 
+**Auto Sync enabled but never runs**
+Action Scheduler requires WooCommerce to be active. Confirm WooCommerce is
+installed and enabled. You can also check the schedule under
+**WooCommerce → Status → Scheduled Actions** — search for
+`totosync_autosync_fire` to see pending or past runs.
+
 ---
 
 ## Changelog
+
+### 2.3.0
+- Added configurable Auto Sync using WooCommerce's Action Scheduler (no server
+  cron required). Interval choices: 15 / 30 / 60 minutes.
+- First enable fires an immediate sync, then repeats on the chosen interval.
+  Changing the interval reschedules without triggering an extra run.
+- Each auto-sync run overwrites `wp-content/uploads/totosync/autosync.log`
+  (only the latest run's log is retained).
+- Live log viewer in the admin panel polls via AJAX every 5 seconds.
+- Deactivation now cancels all pending scheduled actions.
 
 ### 2.2.1
 - Fixed: multiple variations of the same parent product (same `itemName`,
