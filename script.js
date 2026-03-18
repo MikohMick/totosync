@@ -128,4 +128,177 @@ jQuery( function ( $ ) {
     function escHtml( str ) {
         return $( '<span>' ).text( str ).html();
     }
+
+    // ── Debug / Retry panel ───────────────────────────────────────────────────
+    var $debugBtn     = $( '#totosync-debug-btn' );
+    var $debugSku     = $( '#totosync-debug-sku' );
+    var $debugSpinner = $( '#totosync-debug-spinner' );
+    var $debugOutput  = $( '#totosync-debug-output' );
+    var $debugLog     = $( '#totosync-debug-log' );
+
+    $debugBtn.on( 'click', function () {
+        var sku = $.trim( $debugSku.val() );
+        if ( ! sku ) {
+            alert( 'Please enter a SKU first.' );
+            return;
+        }
+
+        $debugBtn.prop( 'disabled', true );
+        $debugSpinner.css( 'visibility', 'visible' );
+        $debugLog.empty();
+        $debugOutput.show();
+        $debugLog.append(
+            '<li style="color:#555;">Fetching API and running debug sync for SKU <strong>' +
+            escHtml( sku ) + '</strong>\u2026</li>'
+        );
+
+        $.post( totosyncAdmin.ajaxurl, {
+            action: 'totosync_debug_item',
+            nonce:  totosyncAdmin.nonce,
+            sku:    sku,
+        } )
+        .done( function ( res ) {
+            $debugLog.empty();
+            if ( ! res.success ) {
+                $debugLog.append(
+                    '<li style="color:#c00;">' + escHtml( res.data || 'Server error.' ) + '</li>'
+                );
+                return;
+            }
+
+            var entries = res.data.log || [];
+            entries.forEach( function ( entry ) {
+                var color = entry.type === 'error'   ? '#c00'
+                          : entry.type === 'warning' ? '#996600'
+                          : entry.type === 'success' ? '#008a00'
+                          : '#333';
+                $debugLog.append(
+                    '<li style="color:' + color + ';margin-bottom:2px;">' +
+                    escHtml( entry.message ) + '</li>'
+                );
+            } );
+
+            // Scroll to bottom so the final verification result is visible.
+            $debugLog[0].scrollTop = $debugLog[0].scrollHeight;
+        } )
+        .fail( function () {
+            $debugLog.empty();
+            $debugLog.append( '<li style="color:#c00;">Request failed — could not reach the server.</li>' );
+        } )
+        .always( function () {
+            $debugBtn.prop( 'disabled', false );
+            $debugSpinner.css( 'visibility', 'hidden' );
+        } );
+    } );
+
+    // Allow pressing Enter in the SKU field to trigger the debug.
+    $debugSku.on( 'keydown', function ( e ) {
+        if ( e.key === 'Enter' ) {
+            $debugBtn.trigger( 'click' );
+        }
+    } );
+
+    // ── Auto Sync panel ───────────────────────────────────────────────────────
+    var $asEnabled  = $( '#totosync-autosync-enabled' );
+    var $asInterval = $( '#totosync-autosync-interval' );
+    var $asSave     = $( '#totosync-autosync-save' );
+    var $asSaveMsg  = $( '#totosync-autosync-save-msg' );
+    var $asLogWrap  = $( '#totosync-autosync-log-wrap' );
+    var $asLog      = $( '#totosync-autosync-log' );
+    var $asNext     = $( '#totosync-autosync-next' );
+
+    var asLogTimer  = null;
+    var AS_LOG_POLL = 5000; // ms
+
+    // Start log polling if autosync is already enabled on page load.
+    if ( totosyncAdmin.autosync_enabled ) {
+        scheduleLogPoll();
+        fetchLog(); // Fetch immediately so the log is visible straight away.
+    }
+
+    // Show / hide the log viewer when the toggle changes.
+    $asEnabled.on( 'change', function () {
+        if ( $( this ).is( ':checked' ) ) {
+            $asLogWrap.show();
+        } else {
+            $asLogWrap.hide();
+            stopLogPoll();
+        }
+    } );
+
+    // Save button.
+    $asSave.on( 'click', function () {
+        $asSave.prop( 'disabled', true );
+        $asSaveMsg.text( 'Saving\u2026' );
+
+        $.post( totosyncAdmin.ajaxurl, {
+            action:   'totosync_autosync_save',
+            nonce:    totosyncAdmin.nonce,
+            enabled:  $asEnabled.is( ':checked' ) ? 1 : 0,
+            interval: $asInterval.val(),
+        } )
+        .done( function ( res ) {
+            if ( ! res.success ) {
+                $asSaveMsg.css( 'color', '#c00' ).text( res.data || 'Error saving settings.' );
+                return;
+            }
+
+            var d = res.data;
+            $asSaveMsg.css( 'color', '#008a00' ).text( 'Saved!' );
+            setTimeout( function () { $asSaveMsg.text( '' ); }, 3000 );
+
+            // Update next-run text.
+            if ( d.enabled && d.next_run > 0 ) {
+                var nextDate = new Date( d.next_run * 1000 );
+                $asNext.html(
+                    'Next run: <strong>' + nextDate.toLocaleString() + '</strong>'
+                );
+            } else if ( d.enabled ) {
+                $asNext.html( 'Immediate run queued&hellip;' );
+            } else {
+                $asNext.html( '' );
+            }
+
+            // Start / stop log polling based on new state.
+            if ( d.enabled ) {
+                $asLogWrap.show();
+                scheduleLogPoll();
+                fetchLog();
+            } else {
+                $asLogWrap.hide();
+                stopLogPoll();
+            }
+        } )
+        .fail( function () {
+            $asSaveMsg.css( 'color', '#c00' ).text( 'Request failed — could not reach the server.' );
+        } )
+        .always( function () {
+            $asSave.prop( 'disabled', false );
+        } );
+    } );
+
+    function scheduleLogPoll() {
+        stopLogPoll();
+        asLogTimer = setInterval( fetchLog, AS_LOG_POLL );
+    }
+
+    function stopLogPoll() {
+        clearInterval( asLogTimer );
+        asLogTimer = null;
+    }
+
+    function fetchLog() {
+        $.post( totosyncAdmin.ajaxurl, {
+            action: 'totosync_autosync_log',
+            nonce:  totosyncAdmin.nonce,
+        } )
+        .done( function ( res ) {
+            if ( res.success && res.data.log ) {
+                var content = res.data.log;
+                $asLog.text( content );
+                // Keep scrolled to bottom so the latest entries are visible.
+                $asLog[0].scrollTop = $asLog[0].scrollHeight;
+            }
+        } );
+    }
 } );

@@ -4,8 +4,8 @@
  * Plugin URI:  https://github.com/MikohMick/totosync
  * Description: Syncs featured products from POS API into WooCommerce — variable products,
  *              attributes (Colour + Measurement), images, prices, and live stock levels.
- *              Manual sync only — no automatic scheduling.
- * Version:     2.3.0
+ *              Supports manual sync and configurable auto-sync (15 / 30 / 60 min).
+ * Version:     2.4.0
  * Author:      rindradev@gmail.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-define( 'TOTOSYNC_VERSION',   '2.3.0' );
+define( 'TOTOSYNC_VERSION',   '2.4.0' );
 define( 'TOTOSYNC_POS_IP',    '197.248.191.179' );
 define( 'TOTOSYNC_API_URL',   'http://shop.ruelsoftware.co.ke/api/FeaturedProducts/' . TOTOSYNC_POS_IP );
 define( 'TOTOSYNC_LOG_OPT',   'totosync_sync_log' );
@@ -36,7 +36,7 @@ define( 'TOTOSYNC_TEST_LIMIT', 0 );
 // this value. The full API is still fetched; only the matching product is synced.
 // Trash step is skipped so other products are not affected.
 // Set to '' (empty string) to process all products normally.
-define( 'TOTOSYNC_TEST_PRODUCT', 'Baby T-shirt Set Of 5' );
+define( 'TOTOSYNC_TEST_PRODUCT', '' );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
@@ -47,8 +47,13 @@ register_deactivation_hook( __FILE__, 'totosync_deactivate' );
 
 add_action( 'admin_menu',            'totosync_admin_menu' );
 add_action( 'admin_enqueue_scripts', 'totosync_enqueue_scripts' );
-add_action( 'wp_ajax_totosync_start_sync', 'totosync_ajax_start_sync' );
-add_action( 'wp_ajax_totosync_poll',       'totosync_ajax_poll' );
+add_action( 'wp_ajax_totosync_start_sync',    'totosync_ajax_start_sync' );
+add_action( 'wp_ajax_totosync_poll',          'totosync_ajax_poll' );
+add_action( 'wp_ajax_totosync_debug_item',    'totosync_ajax_debug_item' );
+add_action( 'wp_ajax_totosync_autosync_save', 'totosync_ajax_autosync_save' );
+add_action( 'wp_ajax_totosync_autosync_log',  'totosync_ajax_autosync_log' );
+
+require_once __DIR__ . '/autosync.php';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation / Deactivation
@@ -65,6 +70,8 @@ function totosync_deactivate() {
     // Clear runtime transients so a stale lock can't block the next manual sync.
     delete_transient( 'totosync_running' );
     delete_transient( TOTOSYNC_PROG_KEY );
+    // Cancel any pending autosync jobs.
+    totosync_autosync_cancel();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,13 +101,19 @@ function totosync_enqueue_scripts( $hook ) {
         TOTOSYNC_VERSION,
         true
     );
-    $prog = get_transient( TOTOSYNC_PROG_KEY );
+    $prog    = get_transient( TOTOSYNC_PROG_KEY );
+    $next_ts = function_exists( 'as_next_scheduled_action' )
+        ? as_next_scheduled_action( TOTOSYNC_AUTOSYNC_HOOK, [], TOTOSYNC_AUTOSYNC_GROUP )
+        : false;
     wp_localize_script( 'totosync-admin', 'totosyncAdmin', [
-        'ajaxurl'   => admin_url( 'admin-ajax.php' ),
-        'nonce'     => wp_create_nonce( 'totosync_nonce' ),
-        'last_sync' => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
-        'running'   => get_transient( 'totosync_running' ) ? true : false,
-        'progress'  => $prog ? $prog : null,
+        'ajaxurl'          => admin_url( 'admin-ajax.php' ),
+        'nonce'            => wp_create_nonce( 'totosync_nonce' ),
+        'last_sync'        => (int) get_option( TOTOSYNC_LAST_OPT, 0 ),
+        'running'          => get_transient( 'totosync_running' ) ? true : false,
+        'progress'         => $prog ? $prog : null,
+        'autosync_enabled' => (bool) get_option( TOTOSYNC_AUTOSYNC_EN_OPT, false ),
+        'autosync_interval'=> (int)  get_option( TOTOSYNC_AUTOSYNC_IV_OPT, 1800 ),
+        'autosync_next'    => $next_ts ? (int) $next_ts : 0,
     ] );
 }
 
@@ -175,6 +188,30 @@ function totosync_page() {
     echo '<div id="totosync-result" style="margin-top:8px;"></div>';
     echo '</div>';
 
+    // ── Debug / Retry panel ───────────────────────────────────────────────────
+    echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+       . 'margin-top:24px;border-radius:4px;max-width:660px;">';
+    echo '<h2 style="margin-top:0">Debug / Retry a Single Item</h2>';
+    echo '<p style="color:#555;font-size:13px;margin-top:0;">'
+       . 'Enter a SKU (itemCode) from the POS system. ToToSync will fetch the full API, '
+       . 'show exactly what the POS is sending for that item, run the sync, '
+       . 'then verify the result in WooCommerce — step by step.</p>';
+
+    echo '<div style="display:flex;gap:8px;align-items:flex-start;">';
+    echo '<input id="totosync-debug-sku" type="text" class="regular-text" '
+       . 'placeholder="e.g. 2848" style="height:36px;font-size:14px;" />';
+    echo '<button id="totosync-debug-btn" class="button button-secondary" '
+       . 'style="height:36px;padding:0 16px;font-size:14px;">Debug &amp; Sync</button>';
+    echo '<span id="totosync-debug-spinner" class="spinner" '
+       . 'style="float:none;margin:4px 0 0 4px;vertical-align:middle;visibility:hidden;"></span>';
+    echo '</div>';
+
+    echo '<div id="totosync-debug-output" style="margin-top:14px;display:none;">'
+       . '<ul id="totosync-debug-log" style="max-height:340px;overflow-y:auto;'
+       . 'padding-left:20px;margin:0;font-size:12px;font-family:monospace;"></ul>'
+       . '</div>';
+    echo '</div>';
+
     // ── Sync log ─────────────────────────────────────────────────────────────
     if ( ! empty( $log ) ) {
         echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
@@ -190,6 +227,72 @@ function totosync_page() {
         echo '</ul>';
         echo '</div>';
     }
+
+    // ── Auto Sync panel ───────────────────────────────────────────────────────
+    $as_enabled  = (bool) get_option( TOTOSYNC_AUTOSYNC_EN_OPT, false );
+    $as_interval = (int)  get_option( TOTOSYNC_AUTOSYNC_IV_OPT, 1800 );
+    $as_next     = function_exists( 'as_next_scheduled_action' )
+        ? as_next_scheduled_action( TOTOSYNC_AUTOSYNC_HOOK, [], TOTOSYNC_AUTOSYNC_GROUP )
+        : false;
+
+    echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:16px 20px;'
+       . 'margin-top:24px;border-radius:4px;max-width:660px;">';
+    echo '<h2 style="margin-top:0">Auto Sync</h2>';
+    echo '<p style="color:#555;font-size:13px;margin-top:0;">'
+       . 'When enabled, ToToSync will run automatically on the selected schedule '
+       . 'using WooCommerce\'s Action Scheduler. The first run fires immediately '
+       . 'after saving.</p>';
+
+    // Settings row.
+    echo '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">';
+
+    // Toggle.
+    echo '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">';
+    echo '<input type="checkbox" id="totosync-autosync-enabled"'
+       . ( $as_enabled ? ' checked' : '' ) . '>';
+    echo '<strong>Enable Auto Sync</strong></label>';
+
+    // Interval dropdown.
+    echo '<label style="font-size:13px;">Interval:&nbsp;';
+    echo '<select id="totosync-autosync-interval" style="height:30px;">';
+    foreach ( [ 900 => 'Every 15 minutes', 1800 => 'Every 30 minutes', 3600 => 'Every 60 minutes' ] as $secs => $label ) {
+        $sel = ( $as_interval === $secs ) ? ' selected' : '';
+        echo '<option value="' . $secs . '"' . $sel . '>' . $label . '</option>';
+    }
+    echo '</select></label>';
+
+    // Save button.
+    echo '<button id="totosync-autosync-save" class="button button-primary" '
+       . 'style="height:30px;padding:0 14px;font-size:13px;">Save</button>';
+    echo '<span id="totosync-autosync-save-msg" style="font-size:12px;color:#555;"></span>';
+
+    echo '</div>'; // settings row
+
+    // Next run info (updated by JS after save).
+    echo '<p id="totosync-autosync-next" style="font-size:12px;color:#555;margin:10px 0 0;">';
+    if ( $as_enabled && $as_next && $as_next > time() ) {
+        echo 'Next run: <strong>'
+           . esc_html( date_i18n( 'D, d M Y H:i:s', $as_next ) )
+           . '</strong> (' . esc_html( human_time_diff( $as_next, time() ) ) . ' away)';
+    } elseif ( $as_enabled ) {
+        echo 'Immediate run queued&hellip;';
+    }
+    echo '</p>';
+
+    // Log viewer — always rendered, hidden/shown by JS.
+    echo '<div id="totosync-autosync-log-wrap" style="margin-top:16px;'
+       . ( $as_enabled ? '' : 'display:none;' ) . '">';
+    echo '<h3 style="margin:0 0 4px;font-size:13px;">Last Auto Sync Log</h3>';
+    echo '<p style="font-size:12px;color:#888;margin:0 0 6px;">Refreshes every 5 seconds.</p>';
+    echo '<pre id="totosync-autosync-log" '
+       . 'style="max-height:320px;overflow-y:auto;background:#f6f7f7;padding:12px;'
+       . 'font-size:11px;line-height:1.6;border:1px solid #ccd0d4;border-radius:3px;'
+       . 'white-space:pre-wrap;word-break:break-all;margin:0;">'
+       . 'No log yet — waiting for first run&hellip;'
+       . '</pre>';
+    echo '</div>';
+
+    echo '</div>'; // autosync panel
 
     echo '</div>'; // .wrap
 }
@@ -241,6 +344,150 @@ function totosync_ajax_start_sync() {
     ] );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AJAX handler — debug / retry a single item by SKU
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Synchronous (inline) AJAX handler — safe for a single item because it
+ * completes well within PHP's max_execution_time for one variation group.
+ */
+function totosync_ajax_debug_item() {
+    check_ajax_referer( 'totosync_nonce', 'nonce' );
+
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized', 403 );
+    }
+
+    $sku = trim( sanitize_text_field( $_POST['sku'] ?? '' ) );
+    if ( $sku === '' ) {
+        wp_send_json_error( 'No SKU entered.' );
+    }
+
+    wp_send_json_success( [ 'log' => totosync_debug_sync_sku( $sku ) ] );
+}
+
+/**
+ * Fetch the API, find every item whose itemCode matches $target_sku,
+ * run the sync for the whole parent-product group it belongs to,
+ * then verify the WooCommerce state — all with step-by-step logging.
+ */
+function totosync_debug_sync_sku( $target_sku ) {
+    $log = [];
+
+    // ── Step 1: Fetch the API ─────────────────────────────────────────────────
+    $log[] = [ 'type' => 'info', 'message' => '① Fetching POS API…' ];
+    $products = totosync_fetch_products();
+    if ( is_wp_error( $products ) ) {
+        $log[] = [ 'type' => 'error', 'message' => 'API fetch failed: ' . $products->get_error_message() ];
+        return $log;
+    }
+    $log[] = [ 'type' => 'info', 'message' => '   API returned ' . count( $products ) . ' items.' ];
+
+    // ── Step 2: Locate the SKU in the API response ────────────────────────────
+    $log[] = [ 'type' => 'info', 'message' => '② Looking for SKU "' . $target_sku . '" in API response...' ];
+
+    $match = null;
+    foreach ( $products as $item ) {
+        if ( trim( $item['itemCode'] ?? '' ) === $target_sku ) {
+            $match = $item;
+            break;
+        }
+    }
+
+    if ( ! $match ) {
+        $log[] = [ 'type' => 'error', 'message' => '   SKU "' . $target_sku . '" was NOT found in the API response.' ];
+        $sample = array_slice(
+            array_filter( array_map( fn( $i ) => trim( $i['itemCode'] ?? '' ), $products ) ),
+            0, 15
+        );
+        $log[] = [ 'type' => 'info', 'message' => '   First 15 SKUs the API returned: ' . implode( ', ', $sample ) ];
+        return $log;
+    }
+
+    $log[] = [ 'type' => 'success', 'message' => '   Found in API:' ];
+    $log[] = [ 'type' => 'info',    'message' => '     itemName    : ' . ( $match['itemName']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     itemCode    : ' . ( $match['itemCode']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     colour      : ' . ( $match['colour']          ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     measurement : ' . ( $match['measurement']     ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     quantity    : ' . ( $match['quantity']        ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     price       : ' . ( $match['price1']          ?? '(empty)' ) ];
+    $log[] = [ 'type' => 'info',    'message' => '     category    : ' . ( $match['productCategory'] ?? '(empty)' ) ];
+    $images = $match['imageUrls'] ?? [];
+    $log[] = [ 'type' => 'info',    'message' => '     imageUrls   : ' . ( $images ? implode( ', ', (array) $images ) : '(none)' ) ];
+
+    // ── Step 3: Find sibling variations (same parent product group) ───────────
+    $parent_name = trim( $match['itemName'] ?? '' );
+    $siblings    = array_filter( $products, fn( $i ) => trim( $i['itemName'] ?? '' ) === $parent_name );
+    $log[] = [ 'type' => 'info', 'message' => '③ Parent product group "' . $parent_name . '" has ' . count( $siblings ) . ' variation(s) in the API.' ];
+    foreach ( $siblings as $s ) {
+        $s_sku   = trim( $s['itemCode']    ?? '' );
+        $s_col   = trim( $s['colour']      ?? '' );
+        $s_meas  = trim( $s['measurement'] ?? '' );
+        $s_qty   = $s['quantity'] ?? 0;
+        $flag    = $s_sku === $target_sku ? ' ◀ (this item)' : '';
+        $log[] = [ 'type' => 'info', 'message' => "     SKU {$s_sku}: {$s_col} / {$s_meas}, qty={$s_qty}{$flag}" ];
+    }
+
+    // ── Step 4: Check current WooCommerce state before sync ───────────────────
+    $log[] = [ 'type' => 'info', 'message' => '④ Checking WooCommerce state before sync…' ];
+    $before_id = wc_get_product_id_by_sku( $target_sku );
+    if ( $before_id ) {
+        $before = wc_get_product( $before_id );
+        $log[] = [ 'type' => 'info', 'message' => "   Found existing product ID {$before_id} — type: " . $before->get_type() . ', status: ' . $before->get_status() . ', stock: ' . $before->get_stock_quantity() ];
+    } else {
+        $log[] = [ 'type' => 'info', 'message' => "   SKU {$target_sku} does not yet exist in WooCommerce." ];
+    }
+
+    // ── Step 5: Run the sync for ALL items in this product group ──────────────
+    $log[] = [ 'type' => 'info', 'message' => '⑤ Running sync for the full product group…' ];
+    $debug_parent_id = 0;
+    foreach ( $siblings as $sibling ) {
+        $result = totosync_process_product( $sibling );
+        $log[]  = $result;
+        if ( ! empty( $result['parent_id'] ) ) {
+            $debug_parent_id = $result['parent_id'];
+        }
+    }
+    if ( $debug_parent_id ) {
+        WC_Product_Variable::sync( $debug_parent_id );
+        wc_delete_product_transients( $debug_parent_id );
+    }
+
+    // ── Step 6: Verify WooCommerce state after sync ───────────────────────────
+    $log[]    = [ 'type' => 'info', 'message' => '⑥ Verifying WooCommerce state after sync…' ];
+    $after_id = wc_get_product_id_by_sku( $target_sku );
+    if ( $after_id ) {
+        $after     = wc_get_product( $after_id );
+        $parent_id = $after->get_parent_id();
+        $log[] = [ 'type' => 'success', 'message' => "   ✓ SKU {$target_sku} exists in WooCommerce as product ID {$after_id}" ];
+        $log[] = [ 'type' => 'info',    'message' => '     type   : ' . $after->get_type() ];
+        $log[] = [ 'type' => 'info',    'message' => '     status : ' . $after->get_status() ];
+        $log[] = [ 'type' => 'info',    'message' => '     stock  : ' . $after->get_stock_quantity() ];
+        if ( $parent_id ) {
+            $parent     = wc_get_product( $parent_id );
+            $cats       = wp_get_post_terms( $parent_id, 'product_cat', [ 'fields' => 'names' ] );
+            $cat_string = ! is_wp_error( $cats ) && $cats ? implode( ', ', $cats ) : '(none)';
+            $log[] = [ 'type' => 'info', 'message' => '     parent : ID ' . $parent_id . ' — "' . $parent->get_name() . '", status: ' . $parent->get_status() ];
+            $log[] = [ 'type' => 'info', 'message' => "     categories: {$cat_string}" ];
+
+            // Count live (non-trashed) variations on the parent.
+            $live_vars = get_posts( [
+                'post_type'      => 'product_variation',
+                'post_parent'    => $parent_id,
+                'post_status'    => 'publish',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ] );
+            $log[] = [ 'type' => 'info', 'message' => '     live variations on parent: ' . count( $live_vars ) ];
+        }
+    } else {
+        $log[] = [ 'type' => 'error', 'message' => "   ✗ After sync, SKU {$target_sku} still not found in WooCommerce. Check the error entries above for the cause." ];
+    }
+
+    return $log;
+}
+
 /**
  * Lightweight polling endpoint — returns the current sync state.
  * JS calls this every 5 s to detect when a background sync finishes.
@@ -275,11 +522,14 @@ function totosync_run_sync() {
 
     // Group items by itemName — the name identifies the parent product;
     // each item in the group becomes a variation regardless of attribute count.
-    $groups = [];
+    $groups        = [];
+    $skipped_early = []; // items dropped before processing (no itemName)
     foreach ( $products as $item ) {
         $name = trim( $item['itemName'] ?? '' );
         if ( $name !== '' ) {
             $groups[ $name ][] = $item;
+        } else {
+            $skipped_early[] = $item;
         }
     }
 
@@ -318,16 +568,73 @@ function totosync_run_sync() {
     $log = [ [
         'type'    => 'info',
         'message' => $mode_label . 'Sync started at ' . date( 'Y-m-d H:i:s' )
-                   . ' (' . $total . ' items across ' . count( $groups ) . ' products)',
+                   . ' — API returned ' . count( $products ) . ' items'
+                   . ( count( $skipped_early ) ? ', ' . count( $skipped_early ) . ' had no name and were skipped' : '' )
+                   . ' (' . $total . ' to process across ' . count( $groups ) . ' products)',
     ] ];
+
+    // Warn about every nameless item upfront.
+    foreach ( $skipped_early as $bad ) {
+        $id  = $bad['itemId']   ?? '?';
+        $sku = trim( $bad['itemCode'] ?? '' );
+        $log[] = [
+            'type'    => 'warning',
+            'message' => "Skipped: item ID {$id}" . ( $sku ? " (SKU {$sku})" : '' ) . ' has no itemName — cannot be synced.',
+        ];
+    }
 
     set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => 0, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
 
-    $processed = 0;
-    foreach ( $items_to_process as $item ) {
-        $log[] = totosync_process_product( $item );
-        $processed++;
-        set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+    $processed      = 0;
+    $confirmed_skus = []; // SKUs confirmed synced successfully — used for crosscheck below.
+
+    // Iterate by group so we can call WC_Product_Variable::sync() once per
+    // parent after ALL its variations are saved, rather than once per variation.
+    foreach ( $groups as $group_items ) {
+        $parent_id_to_sync = 0;
+        foreach ( $group_items as $item ) {
+            $result = totosync_process_product( $item );
+            $log[]  = $result;
+            if ( ( $result['type'] ?? '' ) === 'success' ) {
+                if ( ! empty( $result['sku'] ) ) {
+                    $confirmed_skus[] = $result['sku'];
+                }
+                if ( ! empty( $result['parent_id'] ) ) {
+                    $parent_id_to_sync = $result['parent_id'];
+                }
+            }
+            $processed++;
+            set_transient( TOTOSYNC_PROG_KEY, [ 'processed' => $processed, 'total' => $total ], 15 * MINUTE_IN_SECONDS );
+        }
+        // Rebuild the variation lookup table once now that every variation in
+        // this group has been saved — this is what controls which attribute
+        // options are enabled/disabled on the frontend product page.
+        if ( $parent_id_to_sync ) {
+            WC_Product_Variable::sync( $parent_id_to_sync );
+            wc_delete_product_transients( $parent_id_to_sync );
+        }
+    }
+
+    // ── SKU crosscheck ───────────────────────────────────────────────────────
+    // Compare every SKU the API sent against the ones confirmed synced.
+    // Any gap means an item was attempted but failed (error logged above) OR
+    // had no SKU at all. Surface these clearly so nothing silently slips through.
+    $api_item_skus = array_filter( array_map(
+        fn( $i ) => trim( $i['itemCode'] ?? '' ),
+        $items_to_process
+    ) );
+    $missed_skus = array_diff( $api_item_skus, $confirmed_skus );
+    if ( ! empty( $missed_skus ) ) {
+        $log[] = [
+            'type'    => 'warning',
+            'message' => 'SKU CROSSCHECK — ' . count( $missed_skus ) . ' item(s) were NOT confirmed synced: '
+                       . implode( ', ', $missed_skus ),
+        ];
+    } else {
+        $log[] = [
+            'type'    => 'info',
+            'message' => 'SKU crosscheck passed — all ' . count( $confirmed_skus ) . ' processed items confirmed synced.',
+        ];
     }
 
     // Trash removed products — skipped in test mode since we intentionally
@@ -347,7 +654,16 @@ function totosync_run_sync() {
 
     delete_transient( TOTOSYNC_PROG_KEY );
     update_option( TOTOSYNC_LAST_OPT, time() );
-    update_option( TOTOSYNC_LOG_OPT, array_slice( $log, 0, 300 ) );
+
+    // Save up to 500 log entries. Always preserve ALL errors and warnings;
+    // only trim info/success entries when the cap would otherwise be exceeded.
+    $log_cap     = 500;
+    $critical    = array_values( array_filter( $log, fn( $e ) => in_array( $e['type'] ?? '', [ 'error', 'warning' ], true ) ) );
+    $informative = array_values( array_filter( $log, fn( $e ) => ! in_array( $e['type'] ?? '', [ 'error', 'warning' ], true ) ) );
+    $remaining   = max( 0, $log_cap - count( $critical ) );
+    $log_to_save = array_merge( $critical, array_slice( $informative, 0, $remaining ) );
+    update_option( TOTOSYNC_LOG_OPT, $log_to_save );
+
     error_log( '[ToToSync] Sync done. ' . $total . ' items processed.' );
 }
 
@@ -429,7 +745,7 @@ function totosync_select_test_groups( array $groups, int $limit ): array {
 
 function totosync_fetch_products() {
     $response = wp_remote_get( TOTOSYNC_API_URL, [
-        'timeout'    => 30,
+        'timeout'    => 60,
         'user-agent' => 'ToToSync/' . TOTOSYNC_VERSION,
     ] );
 
@@ -550,14 +866,13 @@ function totosync_sync_variable(
         totosync_attach_image( $variation_id, $images[0] );
     }
 
-    // Bust the parent's cached price range so WooCommerce recalculates it.
-    wc_delete_product_transients( $parent_id );
-
     $attr_parts = array_filter( [ $colour, $measurement ] );
     $stock_msg  = $qty > 0 ? "qty={$qty}" : 'out of stock';
     return [
-        'type'    => 'success',
-        'message' => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
+        'type'      => 'success',
+        'sku'       => $sku,
+        'parent_id' => $parent_id,
+        'message'   => "Synced variation SKU {$sku} (" . implode( ' / ', $attr_parts ) . ", {$stock_msg}) under '{$name}'",
     ];
 }
 
@@ -586,8 +901,16 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
                 wp_set_object_terms( $found[0], 'variable', 'product_type' );
                 $product = new WC_Product_Variable( $found[0] );
             }
-            // Update category; restore from trash if it was removed previously.
-            $product->set_category_ids( [ $cat_id ] );
+            // Merge the API category with whatever categories the client has
+            // manually assigned — never wipe out manually-added categories.
+            // If the API sends no category (cat_id=0) leave existing cats alone.
+            if ( $cat_id ) {
+                $existing_cats = $product->get_category_ids();
+                if ( ! in_array( $cat_id, $existing_cats, true ) ) {
+                    $product->set_category_ids( array_values( array_merge( $existing_cats, [ $cat_id ] ) ) );
+                }
+            }
+            // Restore from trash if it was removed previously.
             $product->set_status( 'publish' );
             $product->save();
         }
@@ -598,7 +921,9 @@ function totosync_get_or_create_parent( $name, $category, $description ) {
     $product->set_name( $name );
     $product->set_description( $description );
     $product->set_status( 'publish' );
-    $product->set_category_ids( [ $cat_id ] );
+    if ( $cat_id ) {
+        $product->set_category_ids( [ $cat_id ] );
+    }
     $id = $product->save();
 
     if ( $id ) {
@@ -666,48 +991,48 @@ function totosync_ensure_term( $taxonomy, $value ) {
 
 /**
  * Add a term to a parent variable product's attribute definition.
- * Uses the proper WC_Product_Attribute API so WooCommerce shows the
- * correct attribute options on the product page.
+ *
+ * Root cause of previous bug: WooCommerce's $product->save() calls
+ * wp_set_object_terms() WITHOUT $append=true, so each per-variation save
+ * replaced all previously accumulated terms with only the current term.
+ * Because items are processed one at a time, the parent always ended up
+ * with only the last-saved variation's single term per attribute.
+ *
+ * Fix: bypass the WC_Product object layer for term assignment entirely.
+ * Use wp_set_object_terms($append=true) so terms always accumulate, and
+ * manage _product_attributes meta directly for the attribute definition
+ * (is_visible / is_variation flags). WooCommerce reads taxonomy attribute
+ * options from wp_get_object_terms(), not from the meta 'value' field,
+ * so this is the canonical, cache-safe way to register options.
  */
 function totosync_add_term_to_parent( $parent_id, $taxonomy, $attr_id, $term_id ) {
     if ( ! $term_id ) {
         return;
     }
 
-    $product    = wc_get_product( $parent_id );
-    if ( ! $product ) {
-        return;
+    // 1. Append the term to the product's taxonomy relationship.
+    //    $append=true means existing terms are NEVER replaced — only new
+    //    ones are added — so every variation's terms accumulate correctly.
+    wp_set_object_terms( $parent_id, [ $term_id ], $taxonomy, /* append */ true );
+
+    // 2. Ensure the attribute definition row exists in _product_attributes.
+    //    For taxonomy attributes WooCommerce ignores the 'value' field and
+    //    reads options via wp_get_object_terms(), so 'value' stays empty.
+    $raw = get_post_meta( $parent_id, '_product_attributes', true );
+    if ( ! is_array( $raw ) ) {
+        $raw = [];
     }
 
-    $attributes = $product->get_attributes();
-    $changed    = false;
-
-    if ( isset( $attributes[ $taxonomy ] ) ) {
-        $attr    = $attributes[ $taxonomy ];
-        $options = $attr->get_options();
-        if ( ! in_array( $term_id, $options, true ) ) {
-            $options[] = $term_id;
-            $attr->set_options( $options );
-            $attributes[ $taxonomy ] = $attr;
-            $changed = true;
-        }
-    } else {
-        $attr = new WC_Product_Attribute();
-        $attr->set_id( $attr_id );
-        $attr->set_name( $taxonomy );
-        $attr->set_options( [ $term_id ] );
-        $attr->set_visible( true );
-        $attr->set_variation( true );
-        $attributes[ $taxonomy ] = $attr;
-        $changed = true;
-    }
-
-    if ( $changed ) {
-        $product->set_attributes( $attributes );
-        $product->save();
-        // Bust WP's object cache and WC's product transients so the next
-        // wc_get_product() call for this parent (e.g. in a subsequent variation
-        // loop iteration) reloads fresh attribute data from the database.
+    if ( ! isset( $raw[ $taxonomy ] ) ) {
+        $raw[ $taxonomy ] = [
+            'name'         => $taxonomy,
+            'value'        => '',
+            'position'     => count( $raw ),
+            'is_visible'   => 1,
+            'is_variation' => 1,
+            'is_taxonomy'  => 1,
+        ];
+        update_post_meta( $parent_id, '_product_attributes', $raw );
         wc_delete_product_transients( $parent_id );
         clean_post_cache( $parent_id );
     }
@@ -770,7 +1095,6 @@ function totosync_get_or_create_variation(
             totosync_set_stock( $child, $qty );
             $child->save();
             totosync_write_variation_attrs( $child_id, $colour, $measurement );
-            WC_Product_Variable::sync( $parent_id );
             return $child_id;
         }
     }
@@ -787,7 +1111,6 @@ function totosync_get_or_create_variation(
 
     if ( $new_id ) {
         totosync_write_variation_attrs( $new_id, $colour, $measurement );
-        WC_Product_Variable::sync( $parent_id );
     }
 
     return $new_id ?: false;
